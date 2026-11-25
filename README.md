@@ -13,52 +13,46 @@ A technical feasibility experiment, **not** a product. It answers one question: 
 
 The APK contains ARM libraries only (`arm64-v8a`, `armeabi-v7a`), which covers practically all phones.
 
-## Microphone test (the app opens on this screen)
+## Main screen (build 6+)
 
-**Sensitivity slider (build 5+).** Listening is continuous, but audio is only *saved* when a sound is louder than the threshold.
-The orange line on the level bar marks the threshold, and the slider (0–100) moves it.
-* High sensitivity saves quieter sounds; 100 = −90 dBFS. Low sensitivity needs louder sounds; 0 = −10 dBFS. The default is 45 = −46 dBFS.
-* Each saved recording includes the 1 s *before* the sound. It ends after 2 s of quiet, where quiet means more than 6 dB below the threshold, so short dips do not split a recording.
-* Very long sounds are split into 60 s parts.
-* Changes apply immediately and are remembered.
-* **Raw 30 s** saves everything for 30 s regardless of the threshold, for troubleshooting.
-* A status line is logged every 5 s even when nothing is saved: the measured level versus the threshold, whether samples arrive, whether they are all zeros.
-* Each recording stores its threshold, sensitivity, trigger level, peak and average level.
+One screen holds everything needed for everyday testing:
 
-**Show Image** displays the image in `app/src/main/assets/display/` full-screen, letterboxed with no distortion. Tap or press Back to return.
-* Listening continues; a small line in the corner shows the live level.
-* To use your own image, replace `display_image.png` with any `.png`, `.jpg` or `.webp` (keep one file in that folder) and rebuild.
-* The screen stays on while the image is shown.
+* **START / STOP LISTENING**, the live level bar (orange line = recording threshold) and listening / saving status.
+* **Sensitivity slider**: sounds louder than the threshold are saved, including the 1 s before them. A recording ends after 2 s of quiet.
+* **Raw 30 s microphone test**: saves everything for 30 s, ignoring the threshold.
+* **Image**: *Choose Image* (gallery or files) and *Show Image* (full screen, aspect ratio kept). Listening continues while the image is shown.
+* **Sync folder** (for OneSync → OneDrive): every completed recording is copied there automatically.
+* **Export**: a ZIP with *Raw*, *Voice-enhanced* or *Both*, plus all diagnostic logs.
+* **Storage** usage and *Clean up…*, the **recording list** (tap = play, long-press = recognize / analyze / label / delete), and the **speech recognition language**.
 
-This is a deliberately minimal experiment: can the phone deliver sound to the app at all? It bypasses the wake word, speech detection, recognition and the ONNX models.
+**Wake word & recognition** opens the original wake-word prototype: enable/disable, wake threshold, Diagnostic Mode, recognizer tests, Commands and Events.
 
-1. Press **START LISTENING**, then make noise: talk, clap, play music, rattle a pot. The big bar and the dBFS numbers react.
-2. Every sample Android delivers is saved, **unmodified and unconditionally** (silence and all-zero audio included), as 60-second WAV parts, until you press **STOP LISTENING**.
-   * Source: the standard `MIC` source at 44.1 kHz, falling back to 48 or 16 kHz.
-   * Recording keeps going when the app is minimized or the screen is off, as far as Android allows.
-3. Tap a recording in the list to play it.
-4. **Export recordings + logs** saves a ZIP containing the WAVs, `mic_test_events.csv` and everything else.
+Technical parameters (audio source, buffers, timings, thresholds …) are no longer shown. They use internal defaults, any earlier saved values are kept, and everything is recorded in the logs.
 
-The status line says plainly what is happening:
+### Sync folder → OneDrive
+1. Main screen → **Choose folder…** → in the picker open *Documents*, create *Jarvis* and then *Dumps*, open it, tap **Use this folder** → **Allow**.
+2. Each completed recording appears there as:
+   * `2026-11-25_11-42-03-517_raw.wav`, the original audio, never processed;
+   * `…_diagnostics.json`, with levels, threshold, sensitivity, events and recognitions.
+3. Each listening session also gets `…_session-log.csv` (refreshed every 30 min) and `…_session.json` (the summary when you press Stop).
+4. Files are written under a hidden `.partial` name and renamed when complete, so a sync app never sees half-written files.
+5. If the folder is unreachable, recordings stay in the app and are copied later.
+6. Jarvis keeps at most 2 GB of its own files in the folder and deletes its oldest files first.
+7. In **OneSync (Autosync for OneDrive)**, create a folder pair from this phone folder to a OneDrive folder.
+   * **"Upload then delete"** is recommended: the phone copy is removed after uploading.
+   * "Upload only" also works.
+   * **Avoid two-way sync**: Jarvis' 2 GB cleanup would then delete files from OneDrive as well.
 
-| Status | Meaning |
-|---|---|
-| 🟢 | Audio arriving |
-| 🟠 No audio | The mic is open, but Android delivers no samples |
-| 🟠 All zeros | Android delivers samples, but they are digital silence: the mic is blocked or silenced |
-| 🔴 | Permission missing, mic could not be opened, or the service was refused |
-| ⚠ | Listening was stopped unexpectedly by Android |
+### Voice-enhanced export
+Choose *Voice-enhanced* or *Both* before exporting. Each enhanced copy is computed only during that export, by the built-in method `jarvis-speech-v1`, in pure Kotlin and fully offline:
+1. 80 Hz high-pass filter (removes rumble).
+2. Wiener noise suppression, as in WebRTC-style denoisers. The noise is estimated from the quietest 15% of the recording, and suppression is capped at 12 dB so quiet speech and consonants survive.
+3. +3 dB presence lift between 1.5 and 4.5 kHz.
+4. Gentle 1.5:1 compression.
+5. Normalisation to about −20 dBFS.
+6. Soft limiter at −1 dBFS.
 
-The background log records the following, so that even a failed session leaves evidence:
-
-* every microphone configuration tried
-* a status line every 5 s: are samples arriving, what share of the expected samples, level, all zeros?
-* read errors, restarts, screen on/off
-* a final verdict per session
-
-The rolling storage limit (500 MB, about 95 minutes at 44.1 kHz) deletes the oldest files first.
-
-**Wake-word screen** (button at the bottom) opens the original prototype unchanged. Starting the wake word ends a running microphone test, and vice versa.
+Files have matching names (`…_raw.wav`, `…_enhanced.wav`, `…_diagnostics.json`), and the JSON records the method and its measurements. If enhancement fails, the original is exported instead and the failure is reported. Original recordings are never modified.
 
 ## First start
 

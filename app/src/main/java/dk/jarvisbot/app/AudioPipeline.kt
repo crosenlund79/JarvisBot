@@ -809,12 +809,12 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
             val f = File(store.audioDir, name)
             try {
                 Wav.write(f, samples, SR)
-                store.insertRecording(
-                    DiagStore.RecordingRow(
-                        recId, startTs, endTs, kind, category, name, f.length(), samples.size * 1000L / SR, SR,
-                        interactionId, maxScore?.toDouble(), label, null, meta?.toString()
-                    )
+                val row = DiagStore.RecordingRow(
+                    recId, startTs, endTs, kind, category, name, f.length(), samples.size * 1000L / SR, SR,
+                    interactionId, maxScore?.toDouble(), label, null, meta?.toString()
                 )
+                store.insertRecording(row)
+                SyncFolder.publish(row)
                 store.log("RECORDING_SAVED", "$kind${category?.let { "/$it" } ?: ""} ${samples.size * 1000L / SR} ms",
                     JSONObject().put("file", name).put("bytes", f.length()), interactionId, recId)
                 val (n, freed) = store.enforceStorageLimit(prefs.storageLimitMb.toLong() * 1024 * 1024)

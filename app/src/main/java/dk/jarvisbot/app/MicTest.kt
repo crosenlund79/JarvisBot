@@ -62,7 +62,8 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
         const val HANGOVER_MS = 2000L
         const val HYSTERESIS_DB = 6.0
         private const val PART_SECONDS = 60
-        private const val STATUS_INTERVAL_MS = 5000L
+        private const val STATUS_INTERVAL_MS = 30_000L
+        private const val SESSION_LOG_INTERVAL_MS = 30 * 60_000L
         private const val NO_AUDIO_MS = 2000L
         private const val RESTART_AFTER_MS = 6000L
         const val DEFAULT_SENSITIVITY = 45
@@ -87,8 +88,10 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
                 val meta = (r.meta?.let { runCatching { JSONObject(it) }.getOrNull() } ?: JSONObject())
                     .put("closeReason", "APP_KILLED_RECOVERED_ON_NEXT_START")
                     .put("statsNote", "rms/peak/zero counts cover only the audio up to the last 10 s checkpoint")
-                store.insertRecording(r.copy(category = "INTERRUPTED", bytes = f.length(),
-                    durationMs = dataBytes / 2 * 1000 / r.sampleRate, meta = meta.toString()))
+                val fixed = r.copy(category = "INTERRUPTED", bytes = f.length(),
+                    durationMs = dataBytes / 2 * 1000 / r.sampleRate, meta = meta.toString())
+                store.insertRecording(fixed)
+                SyncFolder.publish(fixed)
                 store.log("MICTEST_FILE_RECOVERED", "${r.file}: session was killed while recording; file kept (${dataBytes / 2 * 1000 / r.sampleRate} ms)",
                     JSONObject().put("bytes", f.length()), interactionId = r.interactionId, recordingId = r.id)
             }
@@ -159,6 +162,7 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
                 .put("app", "${BuildConfig.VERSION_NAME} (${BuildConfig.GIT_SHA})"),
             interactionId = sessionId, sync = true
         )
+        SyncFolder.catchUp()
         thread = Thread({ runCapture() }, "jarvis-mictest").also { it.start() }
         watchdog = Thread({ runWatchdog() }, "jarvis-mictest-watchdog").also { it.start() }
     }
@@ -440,6 +444,7 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
 
     private fun runWatchdog() {
         var lastStatus = System.currentTimeMillis()
+        var lastSessionLog = lastStatus
         while (running) {
             try { Thread.sleep(500) } catch (_: InterruptedException) { break }
             val now = System.currentTimeMillis()
@@ -463,6 +468,11 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             if (now - lastStatus >= STATUS_INTERVAL_MS) {
                 logStatus(now)
                 lastStatus = now
+            }
+            if (now - lastSessionLog >= SESSION_LOG_INTERVAL_MS) {
+                lastSessionLog = now
+                val startTs = MicStatus.startTs
+                store.runOnWriter { SyncFolder.publishSessionLog(sessionId, startTs, null) }
             }
         }
     }
@@ -531,17 +541,16 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             recordingsSaved == 0 -> "Audio received (loudest %.1f dBFS), but nothing reached the threshold (%.1f dBFS): no recordings saved".format(maxDb, thr)
             else -> "Audio received (loudest %.1f dBFS); %d recording(s), %.0f s saved (threshold %.1f dBFS)".format(maxDb, recordingsSaved, savedMs / 1000.0, thr)
         }
-        store.log(
-            "MICTEST_SESSION_STOP", verdict,
-            JSONObject().put("session", sessionId).put("durationMs", now - MicStatus.startTs).put("micOpenMs", micOpenMsTotal)
+        val summary = JSONObject().put("session", sessionId).put("verdict", verdict).put("durationMs", now - MicStatus.startTs).put("micOpenMs", micOpenMsTotal)
                 .put("sampleRate", rate).put("samples", totalSamples).put("expectedSamples", expected)
                 .put("deliveredPct", if (expected > 0) Math.round(totalSamples * 1000.0 / expected) / 10.0 else JSONObject.NULL)
                 .put("zeroSamples", totalZero).put("allZero", totalSamples > 0 && totalZero == totalSamples)
                 .put("loudestPeakDb", r1(maxDb)).put("sensitivity", sens).put("thresholdDb", thr)
                 .put("recordingsSaved", recordingsSaved).put("savedMs", savedMs).put("micOpens", micOpens)
-                .put("reads", totalReads).put("emptyReads", emptyReads).put("readErrors", readErrors),
-            interactionId = sessionId, sync = true
-        )
+                .put("reads", totalReads).put("emptyReads", emptyReads).put("readErrors", readErrors)
+        store.log("MICTEST_SESSION_STOP", verdict, summary, interactionId = sessionId, sync = true)
+        val startTs = MicStatus.startTs
+        store.runOnWriter { SyncFolder.publishSessionLog(sessionId, startTs, summary) }
         setState(if (micOpens == 0 || totalSamples == 0L) "FAILED" else "STOPPED", verdict)
     }
 
@@ -636,7 +645,10 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
                 id, startTs, System.currentTimeMillis(), "MICTEST", category, file.name, file.length(),
                 samples * 1000 / rate, rate, sessionId, null, null, null, meta.toString()
             )
-            store.runOnWriter { store.insertRecording(row) }
+            store.runOnWriter {
+                store.insertRecording(row)
+                if (closeReason != null) SyncFolder.publish(row) // completed: copy to the sync folder (if configured)
+            }
         }
     }
 }

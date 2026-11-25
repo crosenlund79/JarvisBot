@@ -75,7 +75,7 @@ class DiagStore(private val ctx: Context) : SQLiteOpenHelper(ctx, "jarvis_diag.d
                     put("interaction_id", interactionId); put("recording_id", recordingId); put("proc", processSession)
                 }
                 writableDatabase.insert("events", null, cv)
-                if (insertCount.incrementAndGet() % 2000 == 0L) pruneEvents(300_000)
+                if (insertCount.incrementAndGet() % 2000 == 0L) pruneEvents(MAX_EVENTS)
             } catch (e: Exception) {
                 Log.e("Jarvis", "event insert failed", e)
             }
@@ -289,6 +289,68 @@ class DiagStore(private val ctx: Context) : SQLiteOpenHelper(ctx, "jarvis_diag.d
 
     fun latestRecognition(): RecognitionRow? = recognitions(1).firstOrNull()
 
+    // ------------------------------------------------------------------ sync bookkeeping
+
+    private fun ensureSyncTable() {
+        writableDatabase.execSQL("CREATE TABLE IF NOT EXISTS synced(recording_id TEXT PRIMARY KEY, name TEXT, ts INTEGER)")
+    }
+
+    fun markSynced(recordingId: String, name: String) {
+        ensureSyncTable()
+        writableDatabase.insertWithOnConflict("synced", null, ContentValues().apply {
+            put("recording_id", recordingId); put("name", name); put("ts", System.currentTimeMillis())
+        }, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun syncedName(recordingId: String): String? {
+        ensureSyncTable()
+        return readableDatabase.rawQuery("SELECT name FROM synced WHERE recording_id=?", arrayOf(recordingId)).use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        }
+    }
+
+    /** Completed recordings saved after [sinceTs] that have not been copied to the sync folder yet. */
+    fun unsyncedSince(sinceTs: Long, limit: Int): List<RecordingRow> {
+        ensureSyncTable()
+        val res = ArrayList<RecordingRow>()
+        readableDatabase.rawQuery(
+            "SELECT $recCols FROM recordings WHERE ts_start >= ? AND COALESCE(category,'') <> 'RECORDING' " +
+                "AND id NOT IN (SELECT recording_id FROM synced) ORDER BY ts_start ASC LIMIT $limit", arrayOf(sinceTs.toString())
+        ).use { c -> while (c.moveToNext()) res.add(recFrom(c)) }
+        return res
+    }
+
+    fun eventsBetween(fromTs: Long, toTs: Long, interactionId: String?): List<EventRow> {
+        val res = ArrayList<EventRow>()
+        val sql = "SELECT id, ts, type, msg, data, interaction_id, recording_id, proc FROM events WHERE ts BETWEEN ? AND ? AND " +
+            "(interaction_id = ? OR type LIKE 'HEARTBEAT%' OR type LIKE 'SERVICE%' OR type LIKE 'FGS%' OR type LIKE 'DEVICE_%' " +
+            "OR type LIKE 'MIC_CLIENT%' OR type LIKE 'RECORDING_CLIENTS%' OR type LIKE 'AUDIO_MODE%' OR type LIKE 'PROCESS%' " +
+            "OR type LIKE 'SUSPECTED%' OR type LIKE 'CRASH%' OR type LIKE 'IMAGE_%' OR type LIKE 'SYNC_%' OR type LIKE 'STORAGE%') ORDER BY id"
+        readableDatabase.rawQuery(sql, arrayOf(fromTs.toString(), toTs.toString(), interactionId ?: "")).use { c ->
+            while (c.moveToNext()) res.add(EventRow(c.getLong(0), c.getLong(1), c.getString(2), c.getString(3), c.getString(4), c.getString(5), c.getString(6), c.getString(7)))
+        }
+        return res
+    }
+
+    fun eventsForRecording(recordingId: String): List<EventRow> {
+        val res = ArrayList<EventRow>()
+        readableDatabase.rawQuery("SELECT id, ts, type, msg, data, interaction_id, recording_id, proc FROM events WHERE recording_id=? ORDER BY id LIMIT 50",
+            arrayOf(recordingId)).use { c ->
+            while (c.moveToNext()) res.add(EventRow(c.getLong(0), c.getLong(1), c.getString(2), c.getString(3), c.getString(4), c.getString(5), c.getString(6), c.getString(7)))
+        }
+        return res
+    }
+
+    /** Deletes local recordings that started before [ts]. Returns (count, bytes). Sync folder copies are not touched. */
+    fun deleteRecordingsBefore(ts: Long): Pair<Int, Long> {
+        val rows = ArrayList<RecordingRow>()
+        readableDatabase.rawQuery("SELECT $recCols FROM recordings WHERE ts_start < ? AND COALESCE(category,'') <> 'RECORDING'", arrayOf(ts.toString()))
+            .use { c -> while (c.moveToNext()) rows.add(recFrom(c)) }
+        var bytes = 0L
+        for (r in rows) { fileFor(r).delete(); writableDatabase.delete("recordings", "id=?", arrayOf(r.id)); bytes += r.bytes }
+        return rows.size to bytes
+    }
+
     // ------------------------------------------------------------------ misc
 
     fun count(sql: String): Long = readableDatabase.rawQuery(sql, null).use { c -> if (c.moveToFirst()) c.getLong(0) else 0 }
@@ -305,6 +367,7 @@ class DiagStore(private val ctx: Context) : SQLiteOpenHelper(ctx, "jarvis_diag.d
         db.delete("recordings", null, null)
         db.delete("recognitions", null, null)
         db.delete("events", null, null)
+        runCatching { db.delete("synced", null, null) }
         audioDir.listFiles()?.forEach { it.delete() }
         runCatching { db.execSQL("VACUUM") }
     }
@@ -312,6 +375,8 @@ class DiagStore(private val ctx: Context) : SQLiteOpenHelper(ctx, "jarvis_diag.d
     companion object {
         private val idFmt = ThreadLocal.withInitial { SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US) }
         private val isoFmt = ThreadLocal.withInitial { SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US) }
+        /** Keeps the event log to roughly 100–130 MB at most (about a month of continuous listening). */
+        const val MAX_EVENTS = 150_000
         fun newId(prefix: String): String =
             prefix + "-" + idFmt.get()!!.format(Date()) + "-" + UUID.randomUUID().toString().substring(0, 6)
         fun iso(ts: Long): String = if (ts <= 0) "" else isoFmt.get()!!.format(Date(ts))

@@ -8,6 +8,8 @@ import android.database.MatrixCursor
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
+import dk.jarvisbot.core.SpeechEnhancer
+import dk.jarvisbot.core.Wav
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -21,11 +23,17 @@ object Exporter {
     fun fileName(): String = "jarvis-diagnostics-" +
         java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date()) + ".zip"
 
-    /** Writes the ZIP; returns a short summary. */
-    fun write(ctx: Context, out: OutputStream, includeAudio: Boolean = true): String {
+    /**
+     * Writes the ZIP; returns a short summary.
+     * [audioMode]: RAW (original audio), ENHANCED (voice-enhanced copies), BOTH, or NONE (logs only).
+     * Originals are never modified: enhanced audio is computed in memory for the export only.
+     */
+    fun write(ctx: Context, out: OutputStream, audioMode: String = "RAW", progress: (String) -> Unit = {}): String {
         val app = JarvisApp.instance
         val store = app.store
         var audioFiles = 0
+        var enhancedOk = 0
+        var enhanceFailed = 0
         var events = 0
         ZipOutputStream(out.buffered()).use { zip ->
             fun text(name: String, content: String) {
@@ -40,12 +48,19 @@ object Exporter {
                 .put("byKind", JSONObject().also { o -> store.countsByKind().forEach { (k, v) -> o.put(k, JSONObject().put("count", v.first).put("bytes", v.second)) } })
                 .put("storageLimitMb", app.prefs.storageLimitMb).toString(2))
 
-            // recordings
-            val recs = store.recordings(null, Int.MAX_VALUE)
-            text("recordings.json", JSONArray().also { a -> recs.forEach { a.put(it.toJson()) } }.toString(1))
+            // recordings (export names: <yyyy-MM-dd_HH-mm-ss-SSS>[_kind]_raw.wav / _enhanced.wav / _diagnostics.json)
+            val recs = store.recordings(null, Int.MAX_VALUE).filter { it.category != "RECORDING" }
+            val used = HashSet<String>()
+            val baseOf = HashMap<String, String>()
+            for (r in recs.sortedBy { it.tsStart }) {
+                var b = SyncFolder.baseName(r); var k = 2
+                while (!used.add(b)) b = SyncFolder.baseName(r) + "-" + k++
+                baseOf[r.id] = b
+            }
+            text("recordings.json", JSONArray().also { a -> recs.forEach { a.put(it.toJson().put("export_base", baseOf[it.id])) } }.toString(1))
             text("recordings.csv", csv(
-                listOf("id", "ts_start_iso", "ts_start", "ts_end", "kind", "category", "file", "bytes", "duration_ms", "interaction_id", "max_wake_score", "label", "note"),
-                recs.map { listOf(it.id, DiagStore.iso(it.tsStart), it.tsStart, it.tsEnd, it.kind, it.category, "audio/${it.file}", it.bytes, it.durationMs, it.interactionId, it.maxScore, it.label, it.note) }
+                listOf("id", "export_base", "ts_start_iso", "ts_start", "ts_end", "kind", "category", "phone_file", "bytes", "duration_ms", "interaction_id", "max_wake_score", "label", "note"),
+                recs.map { listOf(it.id, baseOf[it.id], DiagStore.iso(it.tsStart), it.tsStart, it.tsEnd, it.kind, it.category, it.file, it.bytes, it.durationMs, it.interactionId, it.maxScore, it.label, it.note) }
             ))
 
             // recognitions / commands / corrections
@@ -109,20 +124,65 @@ object Exporter {
                 zip.closeEntry()
             }
 
-            if (includeAudio) {
+            if (audioMode != "NONE") {
+                val withRaw = audioMode == "RAW" || audioMode == "BOTH"
+                val withEnh = audioMode == "ENHANCED" || audioMode == "BOTH"
+                var i = 0
                 for (r in recs) {
+                    i++
                     val f = store.fileFor(r)
                     if (!f.exists()) continue
-                    zip.putNextEntry(ZipEntry("audio/${r.file}").apply { method = ZipEntry.STORED; size = f.length(); compressedSize = f.length(); crc = crc32(f) })
-                    f.inputStream().use { it.copyTo(zip) }
-                    zip.closeEntry()
+                    val base = baseOf[r.id]!!
+                    progress("Exporting $i / ${recs.size}" + if (withEnh) " (voice enhancement)" else "")
+                    var rawName: String? = null
+                    var enhName: String? = null
+                    var enhInfo: JSONObject? = null
+                    if (withEnh) {
+                        try {
+                            val (pcm, sr) = Wav.read(f)
+                            val res = SpeechEnhancer.enhance(pcm, sr)
+                            val bytes = wavBytes(res.samples, sr)
+                            enhName = "${base}_enhanced.wav"
+                            stored(zip, "audio/$enhName", bytes)
+                            enhInfo = JSONObject(res.info as Map<*, *>).put("status", "OK")
+                            enhancedOk++
+                        } catch (t: Throwable) {
+                            enhanceFailed++
+                            enhInfo = JSONObject().put("method", SpeechEnhancer.METHOD).put("status", "FAILED")
+                                .put("error", t.toString()).put("note", "original audio included instead")
+                            store.log("ENHANCEMENT_FAILED", "${r.file}: $t", recordingId = r.id)
+                        }
+                    }
+                    if (withRaw || enhName == null) {
+                        rawName = "${base}_raw.wav"
+                        zip.putNextEntry(ZipEntry("audio/$rawName").apply { method = ZipEntry.STORED; size = f.length(); compressedSize = f.length(); crc = crc32(f) })
+                        f.inputStream().use { it.copyTo(zip) }
+                        zip.closeEntry()
+                    }
+                    text("audio/${base}_diagnostics.json", SyncFolder.diagnosticsJson(r, rawName, enhName, enhInfo).toString(2))
                     audioFiles++
                 }
             }
         }
-        val summary = "Exported $audioFiles audio files, $events events"
-        store.log("EXPORT_CREATED", summary)
+        val summary = "Exported $audioFiles recording(s)" +
+            (if (audioMode == "ENHANCED" || audioMode == "BOTH") ", $enhancedOk voice-enhanced" + (if (enhanceFailed > 0) ", $enhanceFailed enhancement FAILED (original included)" else "") else "") +
+            ", $events events"
+        store.log("EXPORT_CREATED", summary, JSONObject().put("audioMode", audioMode).put("enhancedOk", enhancedOk).put("enhanceFailed", enhanceFailed))
         return summary
+    }
+
+    private fun stored(zip: ZipOutputStream, name: String, bytes: ByteArray) {
+        val crc = java.util.zip.CRC32().apply { update(bytes) }
+        zip.putNextEntry(ZipEntry(name).apply { method = ZipEntry.STORED; size = bytes.size.toLong(); compressedSize = bytes.size.toLong(); this.crc = crc.value })
+        zip.write(bytes)
+        zip.closeEntry()
+    }
+
+    private fun wavBytes(samples: ShortArray, sr: Int): ByteArray {
+        val bb = java.nio.ByteBuffer.allocate(Wav.HEADER_BYTES + samples.size * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        bb.put(Wav.header(samples.size * 2L, sr))
+        for (v in samples) bb.putShort(v)
+        return bb.array()
     }
 
     private fun crc32(f: File): Long {
@@ -147,6 +207,11 @@ object Exporter {
         ==========================================
         Created: ${DiagStore.iso(System.currentTimeMillis())}
         App: ${BuildConfig.VERSION_NAME} (code ${BuildConfig.VERSION_CODE}, git ${BuildConfig.GIT_SHA}, built ${BuildConfig.BUILD_TIME})
+
+        AUDIO FILES: audio/<start time>[_kind]_raw.wav = ORIGINAL recording, never modified;
+        audio/<same name>_enhanced.wav = voice-enhanced copy (only if requested at export; method "${SpeechEnhancer.METHOD}":
+        ${SpeechEnhancer.DESCRIPTION}); audio/<same name>_diagnostics.json = levels, threshold, sensitivity, events,
+        recognitions and which enhancement was applied (or why it failed).
 
         MICROPHONE TEST (kind MICTEST, standard MIC source, normally 44.1 kHz, unmodified samples). Recordings are saved when a
         100 ms block's peak reaches the sensitivity threshold (meta: sensitivity, thresholdDb, triggerPeakDb, peakDb, rmsDb),

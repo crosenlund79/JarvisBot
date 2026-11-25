@@ -56,6 +56,14 @@ class Prefs(ctx: Context) {
     var batteryAtEnable: Int get() = i("batteryAtEnable", -1); set(v) = sp.edit().putInt("batteryAtEnable", v).apply()
     /** Microphone test sensitivity 0..100 (higher = quieter sounds are saved). */
     var micSensitivity: Int get() = i("micSensitivity", MicTest.DEFAULT_SENSITIVITY); set(v) = sp.edit().putInt("micSensitivity", v.coerceIn(0, 100)).apply()
+    /** Sync folder (Storage Access Framework tree URI) that an external app such as OneSync uploads from. */
+    var syncTreeUri: String get() = s("syncTreeUri", ""); set(v) = sp.edit().putString("syncTreeUri", v).apply()
+    /** Only recordings saved after this time are copied to the sync folder (set when the folder is chosen). */
+    var syncSinceTs: Long get() = l("syncSinceTs", 0); set(v) = sp.edit().putLong("syncSinceTs", v).apply()
+    /** RAW, ENHANCED or BOTH – audio included in a manual diagnostic export. */
+    var exportAudioMode: String get() = s("exportAudioMode", "RAW"); set(v) = sp.edit().putString("exportAudioMode", v).apply()
+    /** Display name of the image chosen for "Show Image" (the image itself is copied into app storage). */
+    var displayImageName: String get() = s("displayImageName", ""); set(v) = sp.edit().putString("displayImageName", v).apply()
     /** True while a microphone test should be running (survives process death so interruptions can be reported). */
     var micTestActive: Boolean get() = b("micTestActive", false); set(v) = sp.edit().putBoolean("micTestActive", v).commit().let { }
     var lastManualRecordingId: String get() = s("lastManualRecordingId", ""); set(v) = sp.edit().putString("lastManualRecordingId", v).apply()
