@@ -15,6 +15,21 @@ The APK contains ARM libraries only (`arm64-v8a`, `armeabi-v7a`), which covers p
 
 ## Microphone test (the app opens on this screen)
 
+**Sensitivity slider (build 5+).** Listening is continuous, but audio is only *saved* when a sound is louder than the threshold.
+The orange line on the level bar marks the threshold, and the slider (0–100) moves it.
+* High sensitivity saves quieter sounds; 100 = −90 dBFS. Low sensitivity needs louder sounds; 0 = −10 dBFS. The default is 45 = −46 dBFS.
+* Each saved recording includes the 1 s *before* the sound. It ends after 2 s of quiet, where quiet means more than 6 dB below the threshold, so short dips do not split a recording.
+* Very long sounds are split into 60 s parts.
+* Changes apply immediately and are remembered.
+* **Raw 30 s** saves everything for 30 s regardless of the threshold, for troubleshooting.
+* A status line is logged every 5 s even when nothing is saved: the measured level versus the threshold, whether samples arrive, whether they are all zeros.
+* Each recording stores its threshold, sensitivity, trigger level, peak and average level.
+
+**Show Image** displays the image in `app/src/main/assets/display/` full-screen, letterboxed with no distortion. Tap or press Back to return.
+* Listening continues; a small line in the corner shows the live level.
+* To use your own image, replace `display_image.png` with any `.png`, `.jpg` or `.webp` (keep one file in that folder) and rebuild.
+* The screen stays on while the image is shown.
+
 This is a deliberately minimal experiment: can the phone deliver sound to the app at all? It bypasses the wake word, speech detection, recognition and the ONNX models.
 
 1. Press **START LISTENING**, then make noise: talk, clap, play music, rattle a pot. The big bar and the dBFS numbers react.

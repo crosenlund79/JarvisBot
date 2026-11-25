@@ -54,6 +54,8 @@ class Prefs(ctx: Context) {
     var lastExitReasonTs: Long get() = l("lastExitReasonTs", 0); set(v) = sp.edit().putLong("lastExitReasonTs", v).apply()
     var enableTs: Long get() = l("enableTs", 0); set(v) = sp.edit().putLong("enableTs", v).apply()
     var batteryAtEnable: Int get() = i("batteryAtEnable", -1); set(v) = sp.edit().putInt("batteryAtEnable", v).apply()
+    /** Microphone test sensitivity 0..100 (higher = quieter sounds are saved). */
+    var micSensitivity: Int get() = i("micSensitivity", MicTest.DEFAULT_SENSITIVITY); set(v) = sp.edit().putInt("micSensitivity", v.coerceIn(0, 100)).apply()
     /** True while a microphone test should be running (survives process death so interruptions can be reported). */
     var micTestActive: Boolean get() = b("micTestActive", false); set(v) = sp.edit().putBoolean("micTestActive", v).commit().let { }
     var lastManualRecordingId: String get() = s("lastManualRecordingId", ""); set(v) = sp.edit().putString("lastManualRecordingId", v).apply()

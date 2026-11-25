@@ -36,6 +36,7 @@ class ListenerService : Service(), AudioPipeline.Listener {
         const val ACTION_RESTART_MIC = "dk.jarvisbot.action.RESTART_MIC"
         const val ACTION_MICTEST_START = "dk.jarvisbot.action.MICTEST_START"
         const val ACTION_MICTEST_STOP = "dk.jarvisbot.action.MICTEST_STOP"
+        const val ACTION_MICTEST_RAW = "dk.jarvisbot.action.MICTEST_RAW"
         const val EXTRA_SECONDS = "seconds"
         private const val CHANNEL = "jarvis_listening"
         private const val NOTIF_ID = 1001
@@ -109,7 +110,7 @@ class ListenerService : Service(), AudioPipeline.Listener {
         }
         store.log("SERVICE_START_COMMAND", action ?: "null", JSONObject().put("flags", flags).put("startId", startId))
         if (!ensureForeground()) {
-            if (action == ACTION_MICTEST_START || (action == null && prefs.micTestActive)) {
+            if (action == ACTION_MICTEST_START || action == ACTION_MICTEST_RAW || (action == null && prefs.micTestActive)) {
                 MicStatus.state = "FAILED"
                 MicStatus.message = "Android refused to start the listening service: ${LiveStatus.lastError}"
                 prefs.micTestActive = false
@@ -118,7 +119,7 @@ class ListenerService : Service(), AudioPipeline.Listener {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (micTest != null && action != null && action != ACTION_MICTEST_START && action != ACTION_MICTEST_STOP &&
+        if (micTest != null && action != null && action != ACTION_MICTEST_START && action != ACTION_MICTEST_STOP && action != ACTION_MICTEST_RAW &&
             action != ACTION_STOP && action != ACTION_DISABLE && action != ACTION_MARK_MISSED
         ) {
             // A wake-word / capture command arrived while the microphone test runs: end the test first.
@@ -127,6 +128,10 @@ class ListenerService : Service(), AudioPipeline.Listener {
         when (action) {
             ACTION_MICTEST_START -> startMicTest(resumed = false)
             ACTION_MICTEST_STOP -> stopMicTest("USER_STOP", stopService = true)
+            ACTION_MICTEST_RAW -> {
+                startMicTest(resumed = false)
+                micTest?.forceRaw(intent.getIntExtra(EXTRA_SECONDS, 30).coerceIn(1, 300))
+            }
             ACTION_ENABLE -> {
                 prefs.enabled = true
                 prefs.enableTs = System.currentTimeMillis()

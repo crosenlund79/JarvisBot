@@ -7,6 +7,7 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.Process
 import android.os.SystemClock
+import dk.jarvisbot.core.PcmRingBuffer
 import dk.jarvisbot.core.Wav
 import org.json.JSONArray
 import org.json.JSONObject
@@ -36,25 +37,41 @@ object MicStatus {
     @Volatile var levelDb = -120.0
     @Volatile var peakDb = -120.0
     @Volatile var maxPeakDb = -120.0
+    /** Recordings saved in this session. */
     @Volatile var files = 0
+    @Volatile var recordingNow = false
+    @Volatile var recordingSinceTs = 0L
+    @Volatile var rawUntil = 0L
 }
 
 /**
- * Microphone experiment: the simplest possible capture.
- * One AudioRecord on the standard MIC source; every sample Android delivers is written, unconditionally and
- * unmodified, to rolling 60 s WAV files. No VAD, no wake word, no thresholds, no ONNX models are involved.
- * Diagnostics go to the normal event log (types MICTEST_*), linked by session id (interaction_id column).
+ * Microphone experiment: one AudioRecord on the standard MIC source, listening continuously.
+ *
+ * Saving rule (sound-level trigger, works for any sound, not only speech):
+ *  - a recording starts when the peak level of a 100 ms block reaches the sensitivity threshold;
+ *    the preceding [PRE_ROLL_MS] of audio is included so the start of a sound is not lost;
+ *  - it continues until the level has stayed more than [HYSTERESIS_DB] below the threshold for [HANGOVER_MS]
+ *    (short dips do not split a recording); very long sounds are split into [PART_SECONDS] parts;
+ *  - "Raw" forces unconditional recording for a fixed time (troubleshooting).
+ * Lightweight status is logged every 5 s whether or not anything is saved. No VAD, wake word or ONNX is involved.
  */
 class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit) {
     companion object {
         private val RATES = intArrayOf(44100, 48000, 16000) // 44.1 kHz is the only rate Android guarantees
+        const val PRE_ROLL_MS = 1000
+        const val HANGOVER_MS = 2000L
+        const val HYSTERESIS_DB = 6.0
         private const val PART_SECONDS = 60
         private const val STATUS_INTERVAL_MS = 5000L
         private const val NO_AUDIO_MS = 2000L
         private const val RESTART_AFTER_MS = 6000L
+        const val DEFAULT_SENSITIVITY = 45
         private val fileFmt = ThreadLocal.withInitial { SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US) }
         fun db(v: Double) = if (v <= 0.0) -120.0 else max(-120.0, 20.0 * log10(v / 32768.0))
         fun r1(v: Double) = Math.round(v * 10.0) / 10.0
+
+        /** Sensitivity 0..100 → trigger threshold in dBFS (peak). 100 = −90 dBFS (very sensitive), 0 = −10 dBFS. */
+        fun thresholdDb(sensitivity: Int): Double = -90.0 + (100 - sensitivity.coerceIn(0, 100)) * 0.8
 
         /**
          * Called once per process start (before any test can run in this process): WAV parts still marked RECORDING
@@ -87,11 +104,13 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
     @Volatile private var noAudioFlag = false
     private var thread: Thread? = null
     private var watchdog: Thread? = null
-    private var part: WavPart? = null
+    private var ring: PcmRingBuffer? = null
+    private var event: WavPart? = null
+    private var eventLastLoudTs = 0L
     private var partNo = 0
     private val lock = Any()
 
-    // session totals (audio thread; read under lock for the summary)
+    // session totals
     private var totalSamples = 0L
     private var totalZero = 0L
     private var totalReads = 0L
@@ -103,6 +122,8 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
     private var zeroRun = 0L
     private var zerosFlag = false
     private var firstSamplesLogged = false
+    private var recordingsSaved = 0
+    private var savedMs = 0L
 
     // status window (guarded by lock)
     private var winStart = 0L
@@ -112,6 +133,8 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
     private var winPeak = 0
     private var winReads = 0L
     private var winEmptyReads = 0L
+    private var winBlocks = 0
+    private var winAbove = 0
 
     fun start(resumedAfterRestart: Boolean = false) {
         running = true
@@ -120,11 +143,15 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
         MicStatus.startTs = System.currentTimeMillis()
         MicStatus.samples = 0; MicStatus.files = 0; MicStatus.sampleRate = 0
         MicStatus.levelDb = -120.0; MicStatus.peakDb = -120.0; MicStatus.maxPeakDb = -120.0
+        MicStatus.recordingNow = false; MicStatus.rawUntil = 0
         setState("STARTING", "Starting microphone…")
         val am = app.getSystemService(AudioManager::class.java)
+        val sens = app.prefs.micSensitivity
         store.log(
             "MICTEST_SESSION_START", if (resumedAfterRestart) "resumed by Android after the app was restarted" else "user pressed Start",
             JSONObject().put("session", sessionId).put("resumedAfterRestart", resumedAfterRestart)
+                .put("sensitivity", sens).put("thresholdDb", thresholdDb(sens)).put("preRollMs", PRE_ROLL_MS)
+                .put("hangoverMs", HANGOVER_MS).put("hysteresisDb", HYSTERESIS_DB)
                 .put("permissions", Diagnostics.permissions(app)).put("power", Diagnostics.power(app))
                 .put("battery", Diagnostics.battery(app)).put("otherActiveRecordings", am.activeRecordingConfigurations.size)
                 .put("audioMode", Diagnostics.audioModeName(am.mode)).put("micMuted", am.isMicrophoneMute)
@@ -142,6 +169,12 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
         thread?.join(4000)
         watchdog?.interrupt()
         watchdog?.join(1000)
+    }
+
+    /** Record everything (no threshold) for the next [seconds] seconds. */
+    fun forceRaw(seconds: Int) {
+        MicStatus.rawUntil = System.currentTimeMillis() + seconds * 1000L
+        store.log("MICTEST_RAW_STARTED", "Recording everything for ${seconds}s regardless of the threshold", interactionId = sessionId)
     }
 
     private fun setState(state: String, message: String) {
@@ -177,7 +210,7 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             noAudioFlag = false
             LiveStatus.micSessionId = r.audioSessionId
             MicStatus.sampleRate = r.sampleRate
-            synchronized(lock) { resetWindow(micOpenTs) }
+            synchronized(lock) { resetWindow(micOpenTs); ring = PcmRingBuffer(r.sampleRate * 2) }
             setState("STARTING", "Microphone opened (${r.sampleRate} Hz) – waiting for audio…")
             val reason = try {
                 captureLoop(r)
@@ -192,6 +225,7 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             runCatching { r.stop() }
             runCatching { r.release() }
             LiveStatus.micSessionId = -1
+            synchronized(lock) { finishEvent(if (reason == "STOP") "LISTENING_STOPPED" else "MIC_INTERRUPTED") }
             store.log(
                 if (reason == "STOP") "MICTEST_MIC_CLOSED" else "MICTEST_MIC_INTERRUPTED", reason,
                 JSONObject().put("session", sessionId).put("reason", reason), interactionId = sessionId
@@ -201,9 +235,9 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
                 sleepWhileRunning(500)
             }
         }
-        synchronized(lock) { part?.close("SESSION_STOPPED"); part = null }
         logSummary()
         MicStatus.running = false
+        MicStatus.recordingNow = false
     }
 
     private fun sleepWhileRunning(ms: Long) {
@@ -303,23 +337,62 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             val a = abs(v)
             if (a > peak) peak = a
         }
+        val peakDb = db(peak.toDouble())
+        val sens = app.prefs.micSensitivity
+        val thr = thresholdDb(sens)
+        val forced = now < MicStatus.rawUntil
+        val above = peakDb >= thr
+
         synchronized(lock) {
-            var p = part
-            if (p == null || p.rate != rate || p.samples >= rate.toLong() * PART_SECONDS) {
-                p?.close(if (p.rate != rate) "SAMPLE_RATE_CHANGED" else "PART_FULL")
-                p = WavPart(++partNo, rate, now - n * 1000L / rate)
-                part = p
-            }
-            p.write(buf, n, zeros, sumSq, peak)
             winSamples += n; winZero += zeros; winSumSq += sumSq; winPeak = max(winPeak, peak)
+            winBlocks++
+            if (above) winAbove++
+            var ev = event
+            if (ev == null && (above || forced)) {
+                // Start a recording, including the audio just before the trigger.
+                val pre = ring?.copyLast(rate * PRE_ROLL_MS / 1000) ?: ShortArray(0)
+                val trigger = if (above) "LEVEL" else "RAW_BUTTON"
+                ev = WavPart(++partNo, rate, now - (pre.size + n) * 1000L / rate, trigger, peakDb, thr, sens,
+                    pre.size * 1000 / rate, null)
+                event = ev
+                ev.write(pre, pre.size)
+                MicStatus.recordingNow = true
+                MicStatus.recordingSinceTs = ev.startTs
+                store.log(
+                    "MICTEST_RECORDING_STARTED",
+                    if (above) "sound %.1f dBFS reached threshold %.1f dBFS (sensitivity %d)".format(peakDb, thr, sens)
+                    else "raw (unconditional) recording",
+                    JSONObject().put("trigger", trigger).put("triggerPeakDb", r1(peakDb)).put("thresholdDb", thr)
+                        .put("sensitivity", sens).put("preRollMs", pre.size * 1000 / rate),
+                    interactionId = sessionId, recordingId = ev.id
+                )
+            }
+            if (ev != null) {
+                ev.write(buf, n)
+                ev.lastThresholdDb = thr
+                if (forced || peakDb >= thr - HYSTERESIS_DB) eventLastLoudTs = now
+                if (now - eventLastLoudTs >= HANGOVER_MS) {
+                    finishEvent("QUIET_FOR_${HANGOVER_MS}_MS")
+                } else if (ev.samples >= rate.toLong() * PART_SECONDS) {
+                    // Very long sound: split into parts, the next part continues seamlessly.
+                    val prevId = ev.id
+                    ev.close("MAX_LENGTH_${PART_SECONDS}S")
+                    countSaved(ev)
+                    val next = WavPart(++partNo, rate, now, ev.trigger, peakDb, thr, sens, 0, prevId)
+                    event = next
+                    MicStatus.recordingSinceTs = next.startTs
+                }
+            }
         }
+        ring?.write(buf, 0, n)
+
         totalSamples += n
         totalZero += zeros
         maxPeak = max(maxPeak, peak)
         MicStatus.samples = totalSamples
         MicStatus.lastSampleTs = now
         MicStatus.levelDb = db(sqrt(sumSq / n))
-        MicStatus.peakDb = db(peak.toDouble())
+        MicStatus.peakDb = peakDb
         MicStatus.maxPeakDb = db(maxPeak.toDouble())
 
         if (!firstSamplesLogged) {
@@ -346,6 +419,21 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             zeroRun = 0
             if (MicStatus.state != "LISTENING") setState("LISTENING", "Audio is arriving from the microphone.")
         }
+    }
+
+    /** Must be called with [lock] held. */
+    private fun finishEvent(reason: String) {
+        val ev = event ?: return
+        event = null
+        ev.close(reason)
+        countSaved(ev)
+        MicStatus.recordingNow = false
+    }
+
+    private fun countSaved(ev: WavPart) {
+        recordingsSaved++
+        savedMs += ev.samples * 1000 / ev.rate
+        MicStatus.files = recordingsSaved
     }
 
     // ------------------------------------------------------------------ watchdog + periodic status
@@ -381,11 +469,14 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
 
     private fun resetWindow(now: Long) {
         winStart = now; winSamples = 0; winZero = 0; winSumSq = 0.0; winPeak = 0; winReads = 0; winEmptyReads = 0
+        winBlocks = 0; winAbove = 0
     }
 
     private fun logStatus(now: Long) {
         val o = JSONObject()
         val msg: String
+        val sens = app.prefs.micSensitivity
+        val thr = thresholdDb(sens)
         synchronized(lock) {
             val windowMs = now - winStart
             val rate = MicStatus.sampleRate
@@ -395,21 +486,31 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             val pk = db(winPeak.toDouble())
             val allZero = winSamples > 0 && winZero == winSamples
             val arriving = winSamples > 0
+            val recording = event != null
             o.put("session", sessionId).put("windowMs", windowMs).put("micOpen", micOpen).put("sampleRate", rate)
                 .put("samplesArriving", arriving).put("samples", winSamples).put("expectedSamples", expected)
                 .put("deliveredPct", if (expected > 0) Math.round(winSamples * 1000.0 / expected) / 10.0 else JSONObject.NULL)
                 .put("rmsDb", r1(rms)).put("peakDb", r1(pk)).put("zeroSamples", winZero).put("allZero", allZero)
+                .put("sensitivity", sens).put("thresholdDb", thr).put("blocks", winBlocks).put("blocksAboveThreshold", winAbove)
+                .put("recordingActive", recording).put("recordingsSavedTotal", recordingsSaved)
+                .put("rawActive", now < MicStatus.rawUntil)
                 .put("reads", winReads).put("emptyReads", winEmptyReads).put("readErrorsTotal", readErrors)
                 .put("recordingState", rec?.recordingState ?: -1).put("silencedByAndroid", LiveStatus.micSilencedByOs ?: JSONObject.NULL)
                 .put("otherRecordingClients", LiveStatus.otherRecordingClients)
                 .put("screenOn", runCatching { Diagnostics.power(app).optBoolean("screenInteractive") }.getOrNull())
-                .put("file", part?.file?.name)
+                .put("file", event?.file?.name)
             msg = when {
                 !micOpen -> "microphone NOT open"
                 !arriving -> "NO audio samples arriving"
                 allZero -> "samples arriving but ALL ZERO (silenced)"
-                else -> "audio arriving: avg %.1f dBFS, peak %.1f dBFS, %d samples (%s%% of expected)".format(
-                    rms, pk, winSamples, o.opt("deliveredPct"))
+                else -> "audio arriving: avg %.1f dBFS, peak %.1f dBFS vs threshold %.1f dBFS → %s (%s%% of expected samples)".format(
+                    rms, pk, thr,
+                    when {
+                        recording -> "RECORDING"
+                        winAbove > 0 -> "above threshold"
+                        else -> "below threshold, nothing saved"
+                    },
+                    o.opt("deliveredPct"))
             }
             resetWindow(now)
         }
@@ -421,12 +522,14 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
         val rate = MicStatus.sampleRate
         val expected = if (rate > 0) rate.toLong() * micOpenMsTotal / 1000 else 0L
         val maxDb = db(maxPeak.toDouble())
+        val sens = app.prefs.micSensitivity
+        val thr = thresholdDb(sens)
         val verdict = when {
             micOpens == 0 -> "THE MICROPHONE COULD NOT BE OPENED"
             totalSamples == 0L -> "NO AUDIO SAMPLES WERE RECEIVED FROM ANDROID"
             totalZero == totalSamples -> "Android delivered audio samples, but ALL of them were zero (microphone silenced/blocked)"
-            maxDb < -60 -> "Audio received, but extremely quiet (loudest %.1f dBFS)".format(maxDb)
-            else -> "Audio received (loudest %.1f dBFS)".format(maxDb)
+            recordingsSaved == 0 -> "Audio received (loudest %.1f dBFS), but nothing reached the threshold (%.1f dBFS): no recordings saved".format(maxDb, thr)
+            else -> "Audio received (loudest %.1f dBFS); %d recording(s), %.0f s saved (threshold %.1f dBFS)".format(maxDb, recordingsSaved, savedMs / 1000.0, thr)
         }
         store.log(
             "MICTEST_SESSION_STOP", verdict,
@@ -434,21 +537,26 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
                 .put("sampleRate", rate).put("samples", totalSamples).put("expectedSamples", expected)
                 .put("deliveredPct", if (expected > 0) Math.round(totalSamples * 1000.0 / expected) / 10.0 else JSONObject.NULL)
                 .put("zeroSamples", totalZero).put("allZero", totalSamples > 0 && totalZero == totalSamples)
-                .put("loudestPeakDb", r1(maxDb)).put("files", partNo).put("micOpens", micOpens)
+                .put("loudestPeakDb", r1(maxDb)).put("sensitivity", sens).put("thresholdDb", thr)
+                .put("recordingsSaved", recordingsSaved).put("savedMs", savedMs).put("micOpens", micOpens)
                 .put("reads", totalReads).put("emptyReads", emptyReads).put("readErrors", readErrors),
             interactionId = sessionId, sync = true
         )
         setState(if (micOpens == 0 || totalSamples == 0L) "FAILED" else "STOPPED", verdict)
     }
 
-    // ------------------------------------------------------------------ WAV parts
+    // ------------------------------------------------------------------ WAV files
 
-    /** One WAV file. The header is rewritten every ~2 s so the file stays playable even if the app is killed. */
-    private inner class WavPart(val no: Int, val rate: Int, val startTs: Long) {
+    /** One saved recording. The header is rewritten every ~2 s so the file stays playable even if the app is killed. */
+    private inner class WavPart(
+        val no: Int, val rate: Int, val startTs: Long, val trigger: String, val triggerPeakDb: Double,
+        val thresholdAtStart: Double, val sensitivityAtStart: Int, val preRollMs: Int, val continuationOf: String?,
+    ) {
         val id = "$sessionId-p" + "%03d".format(no)
         val file = File(store.audioDir, fileFmt.get()!!.format(Date(startTs)) + "_mictest_" + sessionId.takeLast(6) + "_p" + "%03d".format(no) + ".wav")
         private val raf = RandomAccessFile(file, "rw")
         var samples = 0L
+        var lastThresholdDb = thresholdAtStart
         private var zeroSamples = 0L
         private var sumSq = 0.0
         private var peak = 0
@@ -460,15 +568,23 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             raf.setLength(0)
             raf.write(Wav.header(0, rate))
             saveRow(null)
-            MicStatus.files = no
         }
 
-        fun write(buf: ShortArray, n: Int, zeros: Int, sq: Double, pk: Int) {
+        fun write(buf: ShortArray, n: Int) {
+            if (n <= 0) return
             if (bytes.size < n * 2) bytes = ByteArray(n * 2)
             val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-            for (i in 0 until n) bb.putShort(buf[i])
+            for (i in 0 until n) {
+                val v = buf[i]
+                bb.putShort(v)
+                val iv = v.toInt()
+                if (iv == 0) zeroSamples++
+                sumSq += iv.toDouble() * iv
+                val a = abs(iv)
+                if (a > peak) peak = a
+            }
             raf.write(bytes, 0, n * 2)
-            samples += n; zeroSamples += zeros; sumSq += sq; peak = max(peak, pk)
+            samples += n
             if (samples - headerAt >= rate * 2L) { writeHeader(); headerAt = samples }
             if (samples - rowAt >= rate * 10L) { saveRow(null); rowAt = samples }
         }
@@ -485,9 +601,12 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             runCatching { raf.close() }
             saveRow(reason)
             store.log(
-                "MICTEST_FILE_SAVED", "${file.name}: ${samples * 1000 / rate} ms, peak %.1f dBFS%s".format(
-                    db(peak.toDouble()), if (samples > 0 && zeroSamples == samples) ", ALL ZEROS" else ""),
-                JSONObject().put("reason", reason).put("samples", samples).put("zeroSamples", zeroSamples).put("bytes", file.length()),
+                "MICTEST_FILE_SAVED", "${file.name}: ${samples * 1000 / rate} ms, peak %.1f dBFS, threshold %.1f dBFS, %s".format(
+                    db(peak.toDouble()), lastThresholdDb, reason),
+                JSONObject().put("reason", reason).put("trigger", trigger).put("samples", samples).put("zeroSamples", zeroSamples)
+                    .put("bytes", file.length()).put("peakDb", r1(db(peak.toDouble())))
+                    .put("rmsDb", r1(if (samples > 0) db(sqrt(sumSq / samples)) else -120.0))
+                    .put("thresholdDb", lastThresholdDb).put("triggerPeakDb", r1(triggerPeakDb)),
                 interactionId = sessionId, recordingId = id
             )
             store.runOnWriter {
@@ -501,9 +620,14 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
                 closeReason == null -> "RECORDING"
                 samples == 0L -> "EMPTY"
                 zeroSamples == samples -> "ALL_ZEROS"
-                else -> "AUDIO"
+                trigger == "RAW_BUTTON" -> "RAW"
+                else -> "TRIGGERED"
             }
             val meta = JSONObject().put("session", sessionId).put("part", no).put("source", "MIC").put("sampleRate", rate)
+                .put("trigger", trigger).put("sensitivity", sensitivityAtStart).put("thresholdDb", thresholdAtStart)
+                .put("thresholdDbAtEnd", lastThresholdDb).put("triggerPeakDb", r1(triggerPeakDb))
+                .put("preRollMs", preRollMs).put("hangoverMs", HANGOVER_MS).put("hysteresisDb", HYSTERESIS_DB)
+                .put("continuationOf", continuationOf ?: JSONObject.NULL)
                 .put("samples", samples).put("zeroSamples", zeroSamples)
                 .put("rmsDb", r1(if (samples > 0) db(sqrt(sumSq / samples)) else -120.0)).put("peakDb", r1(db(peak.toDouble())))
                 .put("allZero", samples > 0 && zeroSamples == samples).put("closeReason", closeReason ?: JSONObject.NULL)

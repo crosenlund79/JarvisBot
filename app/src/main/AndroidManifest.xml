@@ -39,6 +39,13 @@
             </intent-filter>
         </activity>
 
+        <!-- Full-screen image (assets/display/). Listening continues in the foreground service while it is shown. -->
+        <activity
+            android:name=".ImageActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden" />
+
         <service
             android:name=".ListenerService"
             android:exported="false"

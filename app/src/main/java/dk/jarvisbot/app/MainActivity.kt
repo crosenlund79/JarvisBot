@@ -769,8 +769,8 @@ class MainActivity : Activity() {
         statusView = null; levelBar = null; scoreBar = null; vadBar = null; listRefresher = null
         val l = vbox().apply { fitsSystemWindows = true }
         l.addView(tv("Microphone test", 22f, bold = true))
-        l.addView(tv("Press Start, make some noise (talk, clap, music, rattle a pot) and watch the bar. " +
-            "Everything Android delivers is recorded – including silence – until you press Stop. Works with the app minimized or the screen off.", 13f))
+        l.addView(tv("Press Start and make noise. The bar always shows the live level; the orange line is the recording threshold. " +
+            "Sounds above it are saved (with 1 s before), until it has been quiet for 2 s. Keeps listening when minimized or with the screen off.", 13f))
         micStateView = tv("", 17f, bold = true)
         l.addView(micStateView)
         l.addView(row(
@@ -783,6 +783,41 @@ class MainActivity : Activity() {
         l.addView(micLevelText)
         micInfoText = tv("", 12f, mono = true)
         l.addView(micInfoText)
+        val sensLabel = tv("", 15f, bold = true)
+        fun showSens(v: Int) {
+            sensLabel.text = "Sensitivity %d  →  saves sounds louder than %.0f dBFS".format(v, MicTest.thresholdDb(v))
+        }
+        showSens(prefs.micSensitivity)
+        l.addView(sensLabel)
+        l.addView(SeekBar(this).apply {
+            max = 100
+            progress = prefs.micSensitivity
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, v: Int, fromUser: Boolean) {
+                    if (!fromUser) return
+                    prefs.micSensitivity = v // read live by the listening service; no restart needed
+                    showSens(v)
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {
+                    val v = prefs.micSensitivity
+                    store.log("MICTEST_SENSITIVITY_CHANGED", "sensitivity $v → threshold %.0f dBFS".format(MicTest.thresholdDb(v)),
+                        JSONObject().put("sensitivity", v).put("thresholdDb", MicTest.thresholdDb(v)), interactionId = MicStatus.sessionId.ifEmpty { null })
+                }
+            })
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
+        l.addView(tv("← low sensitivity (only loud sounds)          high sensitivity (quiet sounds) →", 11f))
+        l.addView(row(
+            btn("Raw 30 s (save everything)") {
+                ensureMic {
+                    micInterrupted = null
+                    if (!MicStatus.running) { MicStatus.state = "STARTING"; MicStatus.message = "Starting…"; micStartRequestedTs = System.currentTimeMillis() }
+                    ListenerService.send(this, ListenerService.ACTION_MICTEST_RAW, 30)
+                    toast("Saving everything for 30 s")
+                }
+            },
+            btn("Show Image") { startActivity(Intent(this, ImageActivity::class.java)) }
+        ))
         l.addView(btn("Export recordings + logs (ZIP)") {
             includeAudioInExport = true
             val i = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("application/zip")
@@ -801,12 +836,16 @@ class MainActivity : Activity() {
                 val t = (cv as? TextView) ?: tv("", 14f)
                 val meta = r.meta?.let { runCatching { JSONObject(it) }.getOrNull() }
                 val peak = meta?.optDouble("peakDb", -120.0) ?: -120.0
+                val thr = meta?.optDouble("thresholdDb", Double.NaN) ?: Double.NaN
+                val thrTxt = if (thr.isNaN()) "" else " (threshold %.0f)".format(thr)
                 val what = when (r.category) {
                     "ALL_ZEROS" -> "ALL ZEROS (silenced)"
                     "EMPTY" -> "no samples"
                     "RECORDING" -> "recording…"
                     "INTERRUPTED" -> "loudest %.0f dBFS (session was killed)".format(peak)
-                    else -> "loudest %.0f dBFS".format(peak)
+                    "RAW" -> "RAW · loudest %.0f dBFS".format(peak)
+                    "TRIGGERED" -> "loudest %.0f dBFS$thrTxt".format(peak)
+                    else -> "continuous · loudest %.0f dBFS".format(peak)
                 }
                 t.text = "${if (r.id == playingId) "▶ " else ""}${fmtTs(r.tsStart)} · %.0f s · %s".format(r.durationMs / 1000.0, what)
                 return t
@@ -886,12 +925,21 @@ class MainActivity : Activity() {
         sv.text = text
         sv.setTextColor(color)
         val live = s.running && now - s.lastSampleTs < 1000
-        micMeter?.set(if (live) s.peakDb else -120.0, if (s.samples > 0) s.maxPeakDb else -120.0)
-        micLevelText?.text = if (live) "Level %.0f dBFS  (peak %.0f)\nLoudest so far: %.0f dBFS".format(s.levelDb, s.peakDb, s.maxPeakDb)
+        val thr = MicTest.thresholdDb(prefs.micSensitivity)
+        micMeter?.set(if (live) s.peakDb else -120.0, if (s.samples > 0) s.maxPeakDb else -120.0, thr)
+        val recTxt = when {
+            !s.running -> ""
+            s.recordingNow && now < s.rawUntil -> "● SAVING (raw, %d s left)".format((s.rawUntil - now) / 1000 + 1)
+            s.recordingNow -> "● SAVING – %.0f s".format((now - s.recordingSinceTs) / 1000.0)
+            else -> "below threshold – not saving"
+        }
+        micLevelText?.text = if (live) "Peak %.0f dBFS · threshold %.0f\n%s".format(s.peakDb, thr, recTxt)
             else if (s.samples > 0) "No live level. Loudest this session: %.0f dBFS".format(s.maxPeakDb) else "No audio received yet"
+        micLevelText?.setTextColor(if (live && s.recordingNow) Color.rgb(255, 110, 110) else Color.LTGRAY)
         val elapsed = if (s.startTs > 0) (if (s.running) now else s.lastSampleTs.coerceAtLeast(s.startTs)) - s.startTs else 0
-        micInfoText?.text = "Recorded: %d:%02d · %s Hz · %,d samples · %d file(s)\nAndroid says mic silenced: %s".format(
+        micInfoText?.text = "Listening: %d:%02d · %s Hz · %,d samples · %d saved · loudest %s\nAndroid says mic silenced: %s".format(
             elapsed / 60000, (elapsed / 1000) % 60, if (s.sampleRate > 0) s.sampleRate.toString() else "-", s.samples, s.files,
+            if (s.samples > 0) "%.0f dBFS".format(s.maxPeakDb) else "-",
             LiveStatus.micSilencedByOs?.let { if (it) "YES" else "no" } ?: "unknown")
         if (tick++ % 30 == 0) micListRefresh?.invoke()
     }
@@ -901,13 +949,15 @@ class MainActivity : Activity() {
 class LevelMeter(ctx: Context) : View(ctx) {
     private var db = -120.0
     private var maxDb = -120.0
+    private var thrDb = Double.NaN
     private val bg = Paint().apply { color = Color.rgb(85, 85, 85) }
     private val fg = Paint()
     private val mark = Paint().apply { color = Color.WHITE; strokeWidth = 6f }
+    private val thrPaint = Paint().apply { color = Color.rgb(255, 150, 0); strokeWidth = 10f }
 
-    fun set(level: Double, loudest: Double) {
-        if (level == db && loudest == maxDb) return
-        db = level; maxDb = loudest; invalidate()
+    fun set(level: Double, loudest: Double, threshold: Double = Double.NaN) {
+        if (level == db && loudest == maxDb && threshold == thrDb) return
+        db = level; maxDb = loudest; thrDb = threshold; invalidate()
     }
 
     private fun frac(d: Double) = ((d + 90.0) / 90.0).coerceIn(0.0, 1.0).toFloat()
@@ -918,5 +968,6 @@ class LevelMeter(ctx: Context) : View(ctx) {
         fg.color = when { db > -6 -> Color.rgb(230, 60, 60); db > -30 -> Color.rgb(230, 200, 60); else -> Color.rgb(70, 200, 90) }
         c.drawRect(0f, 0f, w * frac(db), h, fg)
         if (maxDb > -120.0) { val x = w * frac(maxDb); c.drawLine(x, 0f, x, h, mark) }
+        if (!thrDb.isNaN()) { val x = w * frac(thrDb); c.drawLine(x, 0f, x, h, thrPaint) }
     }
 }
