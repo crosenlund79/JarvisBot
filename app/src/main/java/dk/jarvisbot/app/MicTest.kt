@@ -55,6 +55,27 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
         private val fileFmt = ThreadLocal.withInitial { SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US) }
         fun db(v: Double) = if (v <= 0.0) -120.0 else max(-120.0, 20.0 * log10(v / 32768.0))
         fun r1(v: Double) = Math.round(v * 10.0) / 10.0
+
+        /**
+         * Called once per process start (before any test can run in this process): WAV parts still marked RECORDING
+         * belong to a session that was killed. Fix their header to the full written length and mark them INTERRUPTED.
+         */
+        fun recoverOrphans(app: JarvisApp) {
+            val store = app.store
+            for (r in store.recordings("MICTEST/RECORDING", 100)) {
+                val f = store.fileFor(r)
+                if (!f.exists()) { store.deleteRecording(r.id); continue }
+                val dataBytes = ((f.length() - Wav.HEADER_BYTES).coerceAtLeast(0) / 2) * 2
+                runCatching { RandomAccessFile(f, "rw").use { it.seek(0); it.write(Wav.header(dataBytes, r.sampleRate)) } }
+                val meta = (r.meta?.let { runCatching { JSONObject(it) }.getOrNull() } ?: JSONObject())
+                    .put("closeReason", "APP_KILLED_RECOVERED_ON_NEXT_START")
+                    .put("statsNote", "rms/peak/zero counts cover only the audio up to the last 10 s checkpoint")
+                store.insertRecording(r.copy(category = "INTERRUPTED", bytes = f.length(),
+                    durationMs = dataBytes / 2 * 1000 / r.sampleRate, meta = meta.toString()))
+                store.log("MICTEST_FILE_RECOVERED", "${r.file}: session was killed while recording; file kept (${dataBytes / 2 * 1000 / r.sampleRate} ms)",
+                    JSONObject().put("bytes", f.length()), interactionId = r.interactionId, recordingId = r.id)
+            }
+        }
     }
 
     private val store = app.store

@@ -805,6 +805,7 @@ class MainActivity : Activity() {
                     "ALL_ZEROS" -> "ALL ZEROS (silenced)"
                     "EMPTY" -> "no samples"
                     "RECORDING" -> "recording…"
+                    "INTERRUPTED" -> "loudest %.0f dBFS (session was killed)".format(peak)
                     else -> "loudest %.0f dBFS".format(peak)
                 }
                 t.text = "${if (r.id == playingId) "▶ " else ""}${fmtTs(r.tsStart)} · %.0f s · %s".format(r.durationMs / 1000.0, what)
@@ -900,7 +901,7 @@ class MainActivity : Activity() {
 class LevelMeter(ctx: Context) : View(ctx) {
     private var db = -120.0
     private var maxDb = -120.0
-    private val bg = Paint().apply { color = Color.rgb(45, 45, 45) }
+    private val bg = Paint().apply { color = Color.rgb(85, 85, 85) }
     private val fg = Paint()
     private val mark = Paint().apply { color = Color.WHITE; strokeWidth = 6f }
 

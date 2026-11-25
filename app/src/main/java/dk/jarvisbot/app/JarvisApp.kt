@@ -24,6 +24,7 @@ class JarvisApp : Application() {
                 .put("diagnosticMode", prefs.diagnosticMode)
         )
         Diagnostics.startupChecks(this)
+        runCatching { MicTest.recoverOrphans(this) }.onFailure { store.log("MICTEST_RECOVERY_ERROR", it.toString()) }
     }
 
     private fun installCrashHandler() {
