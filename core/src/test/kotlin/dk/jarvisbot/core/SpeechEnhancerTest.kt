@@ -53,6 +53,11 @@ class SpeechEnhancerTest {
 
     private fun pcm(x: DoubleArray) = ShortArray(x.size) { (x[it] * 32767).toInt().coerceIn(-32768, 32767).toShort() }
     private fun dbl(s: ShortArray) = DoubleArray(s.size) { s[it] / 32768.0 }
+    private fun highPassed(x: DoubleArray, sr: Int): DoubleArray {
+        val f = FloatArray(x.size) { x[it].toFloat() }
+        SpeechEnhancer.highPass(f, sr, 80.0)
+        return DoubleArray(f.size) { f[it].toDouble() }
+    }
 
     /** Ratio (dB) of mean power in speech-active 20 ms frames to mean power in speech-free frames. */
     private fun speechToNoiseDb(clean: DoubleArray, sig: DoubleArray, sr: Int): Double {
@@ -73,10 +78,14 @@ class SpeechEnhancerTest {
         val mix = noisy(clean, sr)
         val input = pcm(mix)
 
+        // The 80 Hz high-pass is intentional and shifts the phase of low harmonics, which SI-SDR would count as error.
+        // So the noise-suppression stage is judged against the high-passed clean signal, starting from the
+        // high-passed noisy input.
+        val hpClean = highPassed(clean, sr)
         val ns = SpeechEnhancer.process(input, sr, full = false)
         val nsOut = dbl(ns.samples)
-        val sdrIn = siSdr(clean, mix)
-        val sdrNs = siSdr(clean, nsOut)
+        val sdrIn = siSdr(hpClean, highPassed(dbl(input), sr))
+        val sdrNs = siSdr(hpClean, nsOut)
 
         val full = SpeechEnhancer.enhance(input, sr)
         val out = dbl(full.samples)

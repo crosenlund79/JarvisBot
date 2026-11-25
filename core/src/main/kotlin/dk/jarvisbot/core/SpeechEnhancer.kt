@@ -71,7 +71,7 @@ object SpeechEnhancer {
 
     // ------------------------------------------------------------------ 1. high-pass
 
-    private fun highPass(x: FloatArray, fs: Int, f0: Double) {
+    internal fun highPass(x: FloatArray, fs: Int, f0: Double) {
         val w0 = 2 * PI * f0 / fs
         val alpha = sin(w0) / (2 * 0.7071)
         val c = cos(w0)
