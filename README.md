@@ -64,6 +64,7 @@ AudioRecord 16 kHz mono PCM16  (one shared capture inside a microphone foregroun
 | Check language support / Request model download | Android 13+ recognizer APIs |
 
 * **Recordings tab:** tap to play. Long-press to recognize, label (`MISSED_WAKE`, `FALSE_WAKE`, `CORRECT_WAKE`, `NOT_WAKE`), add a note, see details or delete.
+  * Long-press → **Analyze with wake engine (offline)** runs a fresh wake-word and VAD instance over that WAV and reports the peak score and its time. Record yourself saying "Hey Jarvis" manually, then analyze it: this tells you whether the engine recognizes *your* voice at all, independent of the live microphone path.
 * **Commands tab:** tap plays the exact recognized audio. Long-press to correct the text, mark a false or correct activation, or re-recognize.
 * **Events tab:** filterable technical log; tap an event for its full JSON.
 
@@ -85,7 +86,7 @@ AudioRecord 16 kHz mono PCM16  (one shared capture inside a microphone foregroun
 | Mic too quiet | `LEVEL.avgDb/maxDb` (speech near the phone is typically −40…−20 dBFS); try the `gain` or `audioSource` settings |
 | Speech not detected | `SPEECH_REGION` missing while `LEVEL.maxDb` rises; listen to a raw capture |
 | Wake engine not processing | `WAKE_ENGINE_INIT_FAILED`, `WAKE_ENGINE_ERROR`; `LEVEL.wakeChunksProcessed` should equal `LEVEL.chunks` |
-| Engine hears it but doesn't trigger | `WAKE_CANDIDATE` with `BELOW_THRESHOLD` and its peak score; `SEGMENT/CANDIDATE` audio |
+| Engine hears it but doesn't trigger | `WAKE_CANDIDATE` with `BELOW_THRESHOLD` and its peak score; `SEGMENT/CANDIDATE` audio; offline analysis of a manual recording |
 | Wake OK, command recording fails | `COMMAND_RECORDING_STOPPED.reason` (`NO_SPEECH_TIMEOUT`…), `RECORDING_SAVE_FAILED` |
 | Recording OK, recognition fails | `RECOGNITION_ERROR` (`ON_DEVICE_UNAVAILABLE`, `ERROR_LANGUAGE_UNAVAILABLE`, …), `recognition_errors.csv` |
 | Wrong text | Commands tab: correct it → `corrections.csv` |
