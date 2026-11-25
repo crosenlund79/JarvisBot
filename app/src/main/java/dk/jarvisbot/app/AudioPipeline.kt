@@ -326,7 +326,7 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
                 "WAKE_ENGINE_INIT", "OK in ${ms} ms",
                 JSONObject().put("engine", "openWakeWord 0.5.1 port").put("model", "hey_jarvis_v0.1.onnx")
                     .put("io", e.modelDescription).put("threshold", cfg.threshold.toDouble())
-                    .put("candidateThreshold", cfg.candThr.toDouble()).put("patience", cfg.patience)
+                    .put("candidateThreshold", r3(cfg.candThr)).put("patience", cfg.patience)
                     .put("onnxRuntime", BuildConfig.ORT_VERSION)
             )
         } catch (t: Throwable) {
@@ -638,7 +638,7 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
         store.log(
             "WAKE_CANDIDATE", "${cand.outcome} peak=%.3f".format(cand.peak),
             JSONObject().put("peakScore", r3(cand.peak)).put("durationMs", now - cand.startTs).put("outcome", cand.outcome)
-                .put("threshold", cfg.threshold.toDouble()).put("candidateThreshold", cfg.candThr.toDouble()),
+                .put("threshold", r3(cfg.threshold)).put("candidateThreshold", r3(cfg.candThr)),
             interactionId = cand.interactionId
         )
     }
