@@ -13,6 +13,38 @@ A technical feasibility experiment, **not** a product. It answers one question: 
 
 The APK contains ARM libraries only (`arm64-v8a`, `armeabi-v7a`), which covers practically all phones.
 
+## Microphone test (the app opens on this screen)
+
+This is a deliberately minimal experiment: can the phone deliver sound to the app at all? It bypasses the wake word, speech detection, recognition and the ONNX models.
+
+1. Press **START LISTENING**, then make noise: talk, clap, play music, rattle a pot. The big bar and the dBFS numbers react.
+2. Every sample Android delivers is saved, **unmodified and unconditionally** (silence and all-zero audio included), as 60-second WAV parts, until you press **STOP LISTENING**.
+   * Source: the standard `MIC` source at 44.1 kHz, falling back to 48 or 16 kHz.
+   * Recording keeps going when the app is minimized or the screen is off, as far as Android allows.
+3. Tap a recording in the list to play it.
+4. **Export recordings + logs** saves a ZIP containing the WAVs, `mic_test_events.csv` and everything else.
+
+The status line says plainly what is happening:
+
+| Status | Meaning |
+|---|---|
+| 🟢 | Audio arriving |
+| 🟠 No audio | The mic is open, but Android delivers no samples |
+| 🟠 All zeros | Android delivers samples, but they are digital silence: the mic is blocked or silenced |
+| 🔴 | Permission missing, mic could not be opened, or the service was refused |
+| ⚠ | Listening was stopped unexpectedly by Android |
+
+The background log records the following, so that even a failed session leaves evidence:
+
+* every microphone configuration tried
+* a status line every 5 s: are samples arriving, what share of the expected samples, level, all zeros?
+* read errors, restarts, screen on/off
+* a final verdict per session
+
+The rolling storage limit (500 MB, about 95 minutes at 44.1 kHz) deletes the oldest files first.
+
+**Wake-word screen** (button at the bottom) opens the original prototype unchanged. Starting the wake word ends a running microphone test, and vice versa.
+
 ## First start
 
 1. Open **Jarvis Proto 001** and grant **Microphone** and **Notifications**.

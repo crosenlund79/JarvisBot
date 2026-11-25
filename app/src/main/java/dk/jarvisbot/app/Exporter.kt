@@ -89,6 +89,7 @@ object Exporter {
             zip.closeEntry()
             val subsets = linkedMapOf(
                 "events.csv" to "1=1",
+                "mic_test_events.csv" to "type LIKE 'MICTEST%' OR type LIKE 'FGS%' OR type LIKE 'SERVICE%' OR type LIKE 'HEARTBEAT%' OR type LIKE 'MIC_CLIENT%' OR type LIKE 'RECORDING_CLIENTS%' OR type LIKE 'AUDIO_MODE%' OR type LIKE 'DEVICE_%' OR type LIKE 'PROCESS%' OR type LIKE 'SUSPECTED%' OR type LIKE 'CRASH%' OR type LIKE 'WAKELOCK%' OR type LIKE 'PERMISSION%' OR type LIKE 'STORAGE%'",
                 "wake_events.csv" to "type LIKE 'WAKE%' OR type LIKE 'USER_MARKED%' OR type LIKE 'ACK_BEEP%' OR type LIKE 'SPEECH_REGION%' OR type LIKE 'COMMAND_%'",
                 "microphone_events.csv" to "type LIKE 'MIC_%' OR type LIKE 'AUDIO_%' OR type='LEVEL' OR type LIKE 'RECORDING_CLIENTS%' OR type LIKE 'RAW_%' OR type LIKE 'MANUAL_%'",
                 "service_events.csv" to "type LIKE 'SERVICE%' OR type LIKE 'FGS%' OR type LIKE 'HEARTBEAT%' OR type LIKE 'PROCESS%' OR type LIKE 'SUSPECTED%' OR type LIKE 'CRASH%' OR type LIKE 'JARVIS_%' OR type LIKE 'WAKELOCK%' OR type LIKE 'DEVICE_%' OR type LIKE 'TASK_%' OR type LIKE 'MEMORY%' OR type LIKE 'SERVICE_TRIM%'",
@@ -147,6 +148,13 @@ object Exporter {
         Created: ${DiagStore.iso(System.currentTimeMillis())}
         App: ${BuildConfig.VERSION_NAME} (code ${BuildConfig.VERSION_CODE}, git ${BuildConfig.GIT_SHA}, built ${BuildConfig.BUILD_TIME})
 
+        MICROPHONE TEST (kind MICTEST): every sample Android delivered between Start and Stop, unmodified, in 60 s WAV parts
+        (standard MIC source, normally 44.1 kHz). recordings.csv: category AUDIO / ALL_ZEROS / EMPTY, meta has per-file
+        rms/peak/zero counts; interaction_id = test session id. mic_test_events.csv: MICTEST_SESSION_START/STOP (with a verdict),
+        MICTEST_MIC_OPENED / MIC_OPEN_FAILED (every configuration tried), MICTEST_STATUS every 5 s (samples arriving?,
+        % of expected samples, level, all-zero?), MICTEST_NO_AUDIO, MICTEST_ONLY_ZEROS, MICTEST_READ_ERROR, MICTEST_MIC_RESTART,
+        MICTEST_INTERRUPTED, plus service/heartbeat/screen events.
+
         All timestamps: epoch milliseconds (ts) plus ISO-8601 local time (iso).
         interaction_id links one wake activation -> WAKE clip -> COMMAND recording -> recognition(s).
         recording_id links events/recognitions to a WAV in audio/.
@@ -157,7 +165,7 @@ object Exporter {
         - settings.json          All app settings (thresholds, timeouts, audio source, recognizer mode, ...).
         - exit_reasons.json      Android's own record of why previous app processes died (Android 11+).
         - recordings.json/.csv   Every stored WAV with kind/category/label and per-80ms traces (wake score, VAD, level) in meta.
-                                 kinds: WAKE (audio before activation), COMMAND (pre-roll + command), SEGMENT (diagnostic-mode
+                                 kinds: MICTEST (microphone test, see above), WAKE (audio before activation), COMMAND (pre-roll + command), SEGMENT (diagnostic-mode
                                  speech/candidate regions: TRIGGERED / CANDIDATE / SPEECH / OTHER), MANUAL, RAW, MISSED_MARK.
         - recognitions.json/.csv Every recognition attempt. audio_binding:
                                    FULL / PARTIAL = recognizer read this many bytes of the stored audio (verified association)

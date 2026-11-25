@@ -4,6 +4,10 @@ import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Typeface
 import android.media.AudioManager
 import android.media.MediaPlayer
@@ -60,6 +64,16 @@ class MainActivity : Activity() {
     private var slowInfo = ""
     private var tick = 0
     private var includeAudioInExport = true
+    private var fullUi = false
+    // microphone test screen
+    private var micStateView: TextView? = null
+    private var micMeter: LevelMeter? = null
+    private var micLevelText: TextView? = null
+    private var micInfoText: TextView? = null
+    private var micListRefresh: (() -> Unit)? = null
+    private var micInterrupted: String? = null
+    private var micStartRequestedTs = 0L
+    private var pendingMicStart = false
 
     companion object {
         private const val REQ_PERMS = 1
@@ -72,6 +86,16 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         app = application as JarvisApp
+        Recognition.onUpdate = { runOnUiThread { if (fullUi && currentTab == "Commands") listRefresher?.invoke() } }
+        cleanupOldExports()
+        showMicTest()
+        if (!Diagnostics.hasMicPermission(this)) requestPerms()
+    }
+
+    /** The original wake-word prototype UI (tabs). */
+    private fun showFullUi() {
+        fullUi = true
+        micStateView = null; micMeter = null
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; fitsSystemWindows = true }
         // Two rows of three tabs so every tab is always reachable on narrow phone screens.
         for (rowTabs in listOf(listOf("Control", "Recordings", "Commands"), listOf("Events", "Settings", "Export"))) {
@@ -87,20 +111,23 @@ class MainActivity : Activity() {
         content = FrameLayout(this)
         root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
-        Recognition.onUpdate = { runOnUiThread { if (currentTab == "Commands") listRefresher?.invoke() } }
-        cleanupOldExports()
         showTab("Control")
-        if (!Diagnostics.hasMicPermission(this)) requestPerms()
+        autostartWakeWordIfEnabled()
+    }
+
+    private fun autostartWakeWordIfEnabled() {
+        if (fullUi && prefs.enabled && !LiveStatus.serviceRunning && Diagnostics.hasMicPermission(this)) {
+            store.log("SERVICE_AUTOSTART_FROM_UI", "Jarvis is enabled but the service was not running; restarting it now")
+            ListenerService.send(this, ListenerService.ACTION_ENABLE)
+        }
     }
 
     override fun onResume() {
         super.onResume()
         handler.post(ticker)
-        store.log("UI_RESUMED", "", JSONObject().put("serviceRunning", LiveStatus.serviceRunning))
-        if (prefs.enabled && !LiveStatus.serviceRunning && Diagnostics.hasMicPermission(this)) {
-            store.log("SERVICE_AUTOSTART_FROM_UI", "Jarvis is enabled but the service was not running; restarting it now")
-            ListenerService.send(this, ListenerService.ACTION_ENABLE)
-        }
+        store.log("UI_RESUMED", "", JSONObject().put("serviceRunning", LiveStatus.serviceRunning).put("micTestRunning", MicStatus.running))
+        checkMicTestInterrupted()
+        autostartWakeWordIfEnabled()
     }
 
     override fun onPause() {
@@ -167,6 +194,7 @@ class MainActivity : Activity() {
 
     private fun controlTab(): View {
         val l = vbox()
+        l.addView(btn("← Back to the microphone test") { showMicTest() })
         statusView = tv("", 12f, mono = true)
         l.addView(statusView)
         l.addView(tv("Mic level (dBFS, -90..0)", 12f)); levelBar = bar(); l.addView(levelBar)
@@ -275,8 +303,8 @@ class MainActivity : Activity() {
 
     private val ticker = object : Runnable {
         override fun run() {
-            updateStatus()
-            handler.postDelayed(this, 250)
+            if (fullUi) updateStatus() else updateMicTest()
+            handler.postDelayed(this, if (fullUi) 250 else 100)
         }
     }
 
@@ -723,5 +751,171 @@ class MainActivity : Activity() {
         val o = JSONObject()
         permissions.forEachIndexed { i, p -> o.put(p.substringAfterLast('.'), if (grantResults.getOrNull(i) == 0) "GRANTED" else "DENIED") }
         store.log("PERMISSION_RESULT", o.toString(), o)
+        if (pendingMicStart) {
+            pendingMicStart = false
+            if (Diagnostics.hasMicPermission(this)) startMicTest()
+            else {
+                MicStatus.state = "FAILED"
+                MicStatus.message = "Microphone permission was denied. Tap 'App settings' → Permissions → Microphone → Allow, then press Start again."
+                store.log("MICTEST_FAILED", "Microphone permission denied by user", sync = true)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ microphone test screen
+
+    private fun showMicTest() {
+        fullUi = false
+        statusView = null; levelBar = null; scoreBar = null; vadBar = null; listRefresher = null
+        val l = vbox().apply { fitsSystemWindows = true }
+        l.addView(tv("Microphone test", 22f, bold = true))
+        l.addView(tv("Press Start, make some noise (talk, clap, music, rattle a pot) and watch the bar. " +
+            "Everything Android delivers is recorded – including silence – until you press Stop. Works with the app minimized or the screen off.", 13f))
+        micStateView = tv("", 17f, bold = true)
+        l.addView(micStateView)
+        l.addView(row(
+            btn("START LISTENING") { startMicTest() }.apply { textSize = 16f },
+            btn("STOP LISTENING") { stopMicTest() }.apply { textSize = 16f }
+        ))
+        micMeter = LevelMeter(this)
+        l.addView(micMeter, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)).apply { setMargins(0, dp(8), 0, dp(4)) })
+        micLevelText = tv("", 15f, mono = true)
+        l.addView(micLevelText)
+        micInfoText = tv("", 12f, mono = true)
+        l.addView(micInfoText)
+        l.addView(btn("Export recordings + logs (ZIP)") {
+            includeAudioInExport = true
+            val i = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("application/zip")
+                .putExtra(Intent.EXTRA_TITLE, Exporter.fileName())
+            startActivityForResult(i, REQ_EXPORT)
+        })
+        l.addView(tv("Recordings – tap to play / stop (newest first)", 15f, bold = true))
+        val list = ListView(this)
+        var items: List<DiagStore.RecordingRow> = emptyList()
+        val adapter = object : BaseAdapter() {
+            override fun getCount() = items.size
+            override fun getItem(p: Int) = items[p]
+            override fun getItemId(p: Int) = p.toLong()
+            override fun getView(p: Int, cv: View?, parent: ViewGroup?): View {
+                val r = items[p]
+                val t = (cv as? TextView) ?: tv("", 14f)
+                val meta = r.meta?.let { runCatching { JSONObject(it) }.getOrNull() }
+                val peak = meta?.optDouble("peakDb", -120.0) ?: -120.0
+                val what = when (r.category) {
+                    "ALL_ZEROS" -> "ALL ZEROS (silenced)"
+                    "EMPTY" -> "no samples"
+                    "RECORDING" -> "recording…"
+                    else -> "loudest %.0f dBFS".format(peak)
+                }
+                t.text = "${if (r.id == playingId) "▶ " else ""}${fmtTs(r.tsStart)} · %.0f s · %s".format(r.durationMs / 1000.0, what)
+                return t
+            }
+        }
+        list.adapter = adapter
+        list.setOnItemClickListener { _, _, p, _ ->
+            val r = items[p]
+            if (playingId == r.id) stopPlayback() else play(r)
+            adapter.notifyDataSetChanged()
+        }
+        micListRefresh = { items = store.recordings("MICTEST", 300); adapter.notifyDataSetChanged() }
+        micListRefresh?.invoke()
+        l.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        l.addView(row(
+            btn("App settings") { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) },
+            btn("Wake-word screen") { showFullUi() }
+        ))
+        setContentView(l)
+    }
+
+    private fun startMicTest() {
+        store.log("MICTEST_START_PRESSED", "", JSONObject().put("permissions", Diagnostics.permissions(this)), sync = true)
+        micInterrupted = null
+        if (!Diagnostics.hasMicPermission(this)) {
+            store.log("MICTEST_FAILED", "Microphone permission not granted – asking for it", sync = true)
+            pendingMicStart = true
+            requestPerms()
+            return
+        }
+        MicStatus.state = "STARTING"
+        MicStatus.message = "Starting…"
+        micStartRequestedTs = System.currentTimeMillis()
+        if (!ListenerService.send(this, ListenerService.ACTION_MICTEST_START)) {
+            MicStatus.state = "FAILED"
+            MicStatus.message = "Could not start the listening service: ${LiveStatus.lastError}"
+            store.log("MICTEST_FAILED", MicStatus.message, sync = true)
+        }
+    }
+
+    private fun stopMicTest() {
+        store.log("MICTEST_STOP_PRESSED", "")
+        micStartRequestedTs = 0
+        if (ListenerService.instance != null) ListenerService.send(this, ListenerService.ACTION_MICTEST_STOP)
+        handler.postDelayed({ micListRefresh?.invoke() }, 1500)
+    }
+
+    /** If a test was running but the service is gone (Android killed the app), say so clearly. */
+    private fun checkMicTestInterrupted() {
+        if (prefs.micTestActive && ListenerService.instance?.micTest == null) {
+            val last = prefs.lastHeartbeatTs
+            micInterrupted = "⚠ Listening stopped unexpectedly – Android probably stopped the app. Last sign of life: ${fmtTs(last)}. Press Start to listen again."
+            store.log("MICTEST_INTERRUPTED", "A microphone test was active, but the listening service was not running when the app was opened",
+                JSONObject().put("lastHeartbeatTs", last).put("lastHeartbeatIso", DiagStore.iso(last)), sync = true)
+            prefs.micTestActive = false
+        }
+    }
+
+    private fun updateMicTest() {
+        val sv = micStateView ?: return
+        val s = MicStatus
+        val now = System.currentTimeMillis()
+        if (!s.running && s.state == "STARTING" && micStartRequestedTs > 0 && now - micStartRequestedTs > 4000) {
+            s.state = "FAILED"
+            s.message = "Listening did not start. ${LiveStatus.lastError}"
+            store.log("MICTEST_FAILED", "Service did not start within 4 s: ${LiveStatus.lastError}", sync = true)
+        }
+        val (text, color) = when {
+            s.state == "FAILED" -> "🔴 MICROPHONE PROBLEM: ${s.message}" to Color.rgb(255, 90, 90)
+            !s.running && micInterrupted != null -> micInterrupted!! to Color.rgb(255, 170, 60)
+            !s.running && s.state == "STOPPED" -> "⚪ Not listening. Last session: ${s.message}" to Color.LTGRAY
+            !s.running -> "⚪ Not listening" to Color.LTGRAY
+            s.state == "LISTENING" -> "🟢 Listening – audio is arriving" to Color.rgb(90, 220, 110)
+            s.state == "NO_AUDIO" || s.state == "ONLY_ZEROS" -> "🟠 ${s.message}" to Color.rgb(255, 170, 60)
+            else -> "⏳ ${s.message}" to Color.LTGRAY
+        }
+        sv.text = text
+        sv.setTextColor(color)
+        val live = s.running && now - s.lastSampleTs < 1000
+        micMeter?.set(if (live) s.peakDb else -120.0, if (s.samples > 0) s.maxPeakDb else -120.0)
+        micLevelText?.text = if (live) "Level %.0f dBFS  (peak %.0f)\nLoudest so far: %.0f dBFS".format(s.levelDb, s.peakDb, s.maxPeakDb)
+            else if (s.samples > 0) "No live level. Loudest this session: %.0f dBFS".format(s.maxPeakDb) else "No audio received yet"
+        val elapsed = if (s.startTs > 0) (if (s.running) now else s.lastSampleTs.coerceAtLeast(s.startTs)) - s.startTs else 0
+        micInfoText?.text = "Recorded: %d:%02d · %s Hz · %,d samples · %d file(s)\nAndroid says mic silenced: %s".format(
+            elapsed / 60000, (elapsed / 1000) % 60, if (s.sampleRate > 0) s.sampleRate.toString() else "-", s.samples, s.files,
+            LiveStatus.micSilencedByOs?.let { if (it) "YES" else "no" } ?: "unknown")
+        if (tick++ % 30 == 0) micListRefresh?.invoke()
+    }
+}
+
+/** Big, simple level bar: −90 dBFS (empty) … 0 dBFS (full), with a marker for the loudest level so far. */
+class LevelMeter(ctx: Context) : View(ctx) {
+    private var db = -120.0
+    private var maxDb = -120.0
+    private val bg = Paint().apply { color = Color.rgb(45, 45, 45) }
+    private val fg = Paint()
+    private val mark = Paint().apply { color = Color.WHITE; strokeWidth = 6f }
+
+    fun set(level: Double, loudest: Double) {
+        if (level == db && loudest == maxDb) return
+        db = level; maxDb = loudest; invalidate()
+    }
+
+    private fun frac(d: Double) = ((d + 90.0) / 90.0).coerceIn(0.0, 1.0).toFloat()
+
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat(); val h = height.toFloat()
+        c.drawRect(0f, 0f, w, h, bg)
+        fg.color = when { db > -6 -> Color.rgb(230, 60, 60); db > -30 -> Color.rgb(230, 200, 60); else -> Color.rgb(70, 200, 90) }
+        c.drawRect(0f, 0f, w * frac(db), h, fg)
+        if (maxDb > -120.0) { val x = w * frac(maxDb); c.drawLine(x, 0f, x, h, mark) }
     }
 }

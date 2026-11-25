@@ -34,6 +34,8 @@ class ListenerService : Service(), AudioPipeline.Listener {
         const val ACTION_MARK_MISSED = "dk.jarvisbot.action.MARK_MISSED"
         const val ACTION_STOP = "dk.jarvisbot.action.STOP"
         const val ACTION_RESTART_MIC = "dk.jarvisbot.action.RESTART_MIC"
+        const val ACTION_MICTEST_START = "dk.jarvisbot.action.MICTEST_START"
+        const val ACTION_MICTEST_STOP = "dk.jarvisbot.action.MICTEST_STOP"
         const val EXTRA_SECONDS = "seconds"
         private const val CHANNEL = "jarvis_listening"
         private const val NOTIF_ID = 1001
@@ -59,6 +61,9 @@ class ListenerService : Service(), AudioPipeline.Listener {
 
     private lateinit var app: JarvisApp
     var pipeline: AudioPipeline? = null
+        private set
+    /** Microphone experiment (bypasses wake word / recognition). Never runs together with [pipeline]. */
+    var micTest: MicTest? = null
         private set
     private var wakeLock: PowerManager.WakeLock? = null
     private val main = Handler(Looper.getMainLooper())
@@ -104,10 +109,24 @@ class ListenerService : Service(), AudioPipeline.Listener {
         }
         store.log("SERVICE_START_COMMAND", action ?: "null", JSONObject().put("flags", flags).put("startId", startId))
         if (!ensureForeground()) {
+            if (action == ACTION_MICTEST_START || (action == null && prefs.micTestActive)) {
+                MicStatus.state = "FAILED"
+                MicStatus.message = "Android refused to start the listening service: ${LiveStatus.lastError}"
+                prefs.micTestActive = false
+                store.log("MICTEST_FAILED", "Foreground service could not start, so the microphone test could not run", sync = true)
+            }
             stopSelf()
             return START_NOT_STICKY
         }
+        if (micTest != null && action != null && action != ACTION_MICTEST_START && action != ACTION_MICTEST_STOP &&
+            action != ACTION_STOP && action != ACTION_DISABLE && action != ACTION_MARK_MISSED
+        ) {
+            // A wake-word / capture command arrived while the microphone test runs: end the test first.
+            stopMicTest("WAKE_WORD_MODE_REQUESTED", stopService = false)
+        }
         when (action) {
+            ACTION_MICTEST_START -> startMicTest(resumed = false)
+            ACTION_MICTEST_STOP -> stopMicTest("USER_STOP", stopService = true)
             ACTION_ENABLE -> {
                 prefs.enabled = true
                 prefs.enableTs = System.currentTimeMillis()
@@ -139,9 +158,11 @@ class ListenerService : Service(), AudioPipeline.Listener {
                 stopEverything()
             }
             else -> {
-                if (prefs.enabled) {
+                if (action == null && prefs.micTestActive) {
+                    startMicTest(resumed = true)
+                } else if (prefs.enabled) {
                     ensurePipeline(); pipeline?.wakeEnabled = true
-                } else if (pipeline == null) {
+                } else if (pipeline == null && micTest == null) {
                     stopEverything()
                 }
             }
@@ -180,16 +201,23 @@ class ListenerService : Service(), AudioPipeline.Listener {
             it.wakeEnabled = prefs.enabled
             it.start()
         }
-        if (prefs.wakeLock) {
-            val pm = getSystemService(PowerManager::class.java)
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "jarvis:listening").also {
-                it.setReferenceCounted(false)
-                it.acquire()
-            }
-            app.store.log("WAKELOCK_ACQUIRED", "PARTIAL_WAKE_LOCK held while listening")
-        } else {
-            app.store.log("WAKELOCK_DISABLED", "No wake lock (setting); the CPU may sleep with the screen off")
+        if (prefs.wakeLock) acquireWakeLock()
+        else app.store.log("WAKELOCK_DISABLED", "No wake lock (setting); the CPU may sleep with the screen off")
+        markRunning()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        val pm = getSystemService(PowerManager::class.java)
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "jarvis:listening").also {
+            it.setReferenceCounted(false)
+            it.acquire()
         }
+        app.store.log("WAKELOCK_ACQUIRED", "PARTIAL_WAKE_LOCK held while listening")
+    }
+
+    private fun markRunning() {
+        val prefs = app.prefs
         registerMonitors()
         prefs.svcRunningMarker = true
         prefs.svcStartTs = System.currentTimeMillis()
@@ -199,15 +227,43 @@ class ListenerService : Service(), AudioPipeline.Listener {
         main.post(heartbeat)
     }
 
+    private fun startMicTest(resumed: Boolean) {
+        if (micTest != null) return
+        val store = app.store
+        if (pipeline != null) {
+            store.log("MICTEST_STOPPING_WAKE_WORD", "Wake-word pipeline stopped so the microphone test has the microphone to itself")
+            app.prefs.enabled = false
+            pipeline?.stop()
+            pipeline = null
+        }
+        app.prefs.micTestActive = true
+        cleanStop = false
+        acquireWakeLock() // always: listening must continue with the screen off
+        micTest = MicTest(app) { main.post { updateNotification(force = true) } }.also { it.start(resumed) }
+        markRunning()
+    }
+
+    private fun stopMicTest(reason: String, stopService: Boolean) {
+        val t = micTest ?: run { if (stopService) maybeStop(); return }
+        app.store.log("MICTEST_STOP_REQUESTED", reason, interactionId = t.sessionId)
+        t.stop()
+        micTest = null
+        app.prefs.micTestActive = false
+        if (stopService) maybeStop()
+    }
+
     private fun maybeStop() {
         val p = pipeline
-        if (!app.prefs.enabled && (p == null || !p.hasActiveCapture)) stopEverything()
+        if (!app.prefs.enabled && micTest == null && (p == null || !p.hasActiveCapture)) stopEverything()
     }
 
     private fun stopEverything() {
-        if (cleanStop && pipeline == null) return
+        if (cleanStop && pipeline == null && micTest == null) return
         cleanStop = true
         main.removeCallbacks(heartbeat)
+        micTest?.let { app.store.log("MICTEST_STOP_REQUESTED", "service stopping", interactionId = it.sessionId); it.stop() }
+        micTest = null
+        app.prefs.micTestActive = false
         pipeline?.stop()
         pipeline = null
         releaseWakeLock()
@@ -229,10 +285,12 @@ class ListenerService : Service(), AudioPipeline.Listener {
 
     override fun onDestroy() {
         main.removeCallbacks(heartbeat)
-        if (pipeline != null) {
-            app.store.log("SERVICE_DESTROYED_UNEXPECTEDLY", "onDestroy while pipeline was running (system stop?)", sync = true)
+        if (pipeline != null || micTest != null) {
+            app.store.log("SERVICE_DESTROYED_UNEXPECTEDLY", "onDestroy while audio capture was running (system stop?)", sync = true)
             pipeline?.stop()
             pipeline = null
+            micTest?.stop()
+            micTest = null
         }
         releaseWakeLock()
         unregisterMonitors()
@@ -266,7 +324,9 @@ class ListenerService : Service(), AudioPipeline.Listener {
             val prefs = app.prefs
             val p = pipeline
             val audioAge = if (LiveStatus.lastAudioChunkTs > 0) now - LiveStatus.lastAudioChunkTs else -1
-            val info = "state=${LiveStatus.state} mic=${LiveStatus.micOpen} chunks=${LiveStatus.chunks} audioAgeMs=$audioAge"
+            val info = if (micTest != null)
+                "mictest state=${MicStatus.state} samples=${MicStatus.samples} lastSampleAgeMs=${if (MicStatus.lastSampleTs > 0) now - MicStatus.lastSampleTs else -1}"
+            else "state=${LiveStatus.state} mic=${LiveStatus.micOpen} chunks=${LiveStatus.chunks} audioAgeMs=$audioAge"
             prefs.lastHeartbeatTs = now
             prefs.lastHeartbeatInfo = info
             LiveStatus.lastHeartbeat = now
@@ -283,6 +343,8 @@ class ListenerService : Service(), AudioPipeline.Listener {
                         .put("batteryDrainPctPerHourSinceEnable", drain ?: Diagnostics.UNAVAILABLE)
                         .put("power", Diagnostics.power(this@ListenerService))
                         .put("procAvgMs", LiveStatus.procAvgMs).put("micErrors", LiveStatus.micErrors)
+                        .put("micTest", if (micTest != null) JSONObject().put("state", MicStatus.state).put("samples", MicStatus.samples)
+                            .put("sampleRate", MicStatus.sampleRate).put("files", MicStatus.files) else JSONObject.NULL)
                 )
                 lastHeartbeatLog = now
                 chunksAtLastLog = LiveStatus.chunks
@@ -441,20 +503,25 @@ class ListenerService : Service(), AudioPipeline.Listener {
             this, code, Intent(this, ListenerService::class.java).setAction(action),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        return Notification.Builder(this, CHANNEL)
+        val b = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_jarvis)
-            .setContentTitle("Jarvis prototype")
+            .setContentTitle(if (micTest != null) "Jarvis microphone test" else "Jarvis prototype")
             .setContentText(text)
-            .setSubText(if (app.prefs.diagnosticMode) "Diagnostic mode ON" else null)
+            .setSubText(if (micTest == null && app.prefs.diagnosticMode) "Diagnostic mode ON" else null)
             .setOngoing(true)
             .setContentIntent(open)
             .setCategory(Notification.CATEGORY_SERVICE)
-            .addAction(Notification.Action.Builder(null, "Missed it!", svc(ACTION_MARK_MISSED, 1)).build())
-            .addAction(Notification.Action.Builder(null, "Stop", svc(ACTION_STOP, 2)).build())
-            .build()
+        if (micTest == null) b.addAction(Notification.Action.Builder(null, "Missed it!", svc(ACTION_MARK_MISSED, 1)).build())
+        return b.addAction(Notification.Action.Builder(null, "Stop", svc(ACTION_STOP, 2)).build()).build()
     }
 
-    private fun currentText(): String = when {
+    private fun currentText(): String = if (micTest != null) when (MicStatus.state) {
+        "LISTENING" -> "Listening – recording everything the microphone delivers"
+        "NO_AUDIO" -> "⚠ Microphone open, but Android delivers no audio"
+        "ONLY_ZEROS" -> "⚠ Android delivers only silence (all zeros) – microphone blocked?"
+        "FAILED" -> "⚠ Microphone failed – open the app for details"
+        else -> "Starting microphone…"
+    } else when {
         LiveStatus.micSilencedByOs == true || LiveStatus.digitalSilence -> "⚠ Microphone silenced by Android / another app"
         !LiveStatus.micOpen && pipeline != null -> "⚠ Microphone not available – retrying (${LiveStatus.lastError})"
         LiveStatus.state == "COMMAND" -> "Recording command…"
