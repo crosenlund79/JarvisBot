@@ -8,13 +8,21 @@ import kotlin.math.min
  * [MAX_CHUNK_S] seconds (at quiet points), and run Whisper on each chunk. Audio without detected speech is not sent to
  * Whisper at all (Whisper tends to invent text for pure noise), and is reported as "no speech".
  */
-class SpeechTranscriber(private val whisper: WhisperModel, private val vad: SileroVad, private val vadThreshold: Float = 0.5f) {
+class SpeechTranscriber(private val whisper: () -> WhisperModel, private val vad: SileroVad, private val vadThreshold: Float = 0.5f) {
+    /** [whisper] is only requested when speech was found, so it can be loaded lazily. */
+    constructor(model: WhisperModel, vad: SileroVad, vadThreshold: Float = 0.5f) : this({ model }, vad, vadThreshold)
+
     companion object {
         const val MAX_CHUNK_S = 20
         private const val FRAME = 640 // 40 ms at 16 kHz (as used by openWakeWord)
         private const val PAD_FRAMES = 8 // 320 ms kept before / after detected speech
         private const val MERGE_GAP_FRAMES = 25 // pauses up to 1 s stay in the same segment
         private const val MAX_CHUNK_FRAMES = MAX_CHUNK_S * 1000 / 40
+        /**
+         * Frames quieter than this never count as speech. Silero VAD ignores level and can report "speech" for
+         * near-silent digital noise; real speech on a phone microphone is around -50..-30 dBFS.
+         */
+        const val MIN_SPEECH_DBFS = -70.0
     }
 
     class Chunk(val startMs: Long, val endMs: Long, val result: WhisperModel.Result)
@@ -22,9 +30,12 @@ class SpeechTranscriber(private val whisper: WhisperModel, private val vad: Sile
     class Transcript(
         val audioMs: Long,
         val speechMs: Long,
+        /** Highest speech probability among frames above [MIN_SPEECH_DBFS]. */
         val maxSpeechProb: Float,
         val chunks: List<Chunk>,
         val processingMs: Long,
+        /** Level (RMS, dBFS) of the loudest 40 ms frame. */
+        val maxLevelDb: Double = 0.0,
     ) {
         val text: String get() = chunks.map { it.result.text }.filter { it.isNotBlank() }.joinToString(" ")
         val hasText: Boolean get() = chunks.any { it.result.text.isNotBlank() }
@@ -54,15 +65,24 @@ class SpeechTranscriber(private val whisper: WhisperModel, private val vad: Sile
         val n = audio.size / FRAME
         // Speech probability per 40 ms frame.
         val probs = FloatArray(n)
+        var maxLevel = -120.0
         vad.reset()
         val buf = ShortArray(FRAME)
         for (f in 0 until n) {
-            for (j in 0 until FRAME) buf[j] = (audio[f * FRAME + j] * 32767f).toInt().coerceIn(-32768, 32767).toShort()
-            probs[f] = vad.process(buf, 0, FRAME)
+            var e = 0.0
+            for (j in 0 until FRAME) {
+                val v = audio[f * FRAME + j]
+                e += v * v
+                buf[j] = (v * 32767f).toInt().coerceIn(-32768, 32767).toShort()
+            }
+            val db = 10 * kotlin.math.log10(e / FRAME + 1e-12)
+            if (db > maxLevel) maxLevel = db
+            val p = vad.process(buf, 0, FRAME) // always run, so the detector's state follows the audio
+            probs[f] = if (db >= MIN_SPEECH_DBFS) p else 0f
         }
         val maxProb = probs.maxOrNull() ?: 0f
         val speechFrames = probs.count { it >= vadThreshold }
-        if (speechFrames == 0) return Transcript(audioMs, 0, maxProb, emptyList(), System.currentTimeMillis() - t0)
+        if (speechFrames == 0) return Transcript(audioMs, 0, maxProb, emptyList(), System.currentTimeMillis() - t0, maxLevel)
 
         // Segments of speech, padded and merged across short pauses.
         val segs = ArrayList<IntArray>()
@@ -95,9 +115,9 @@ class SpeechTranscriber(private val whisper: WhisperModel, private val vad: Sile
         for (c in chunks) {
             val from = c[0] * FRAME
             val to = min(audio.size, c[1] * FRAME)
-            val r = whisper.transcribe(audio.copyOfRange(from, to), languages)
+            val r = whisper().transcribe(audio.copyOfRange(from, to), languages)
             out.add(Chunk(from / 16L, to / 16L, r))
         }
-        return Transcript(audioMs, speechFrames * 40L, maxProb, out, System.currentTimeMillis() - t0)
+        return Transcript(audioMs, speechFrames * 40L, maxProb, out, System.currentTimeMillis() - t0, maxLevel)
     }
 }

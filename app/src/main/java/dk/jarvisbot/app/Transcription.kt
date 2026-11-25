@@ -187,19 +187,35 @@ object Transcription {
 
     private class EngineUnavailable(msg: String) : Exception(msg)
 
-    private class Engine(app: JarvisApp, threads: Int) : AutoCloseable {
+    /** Voice detector (small, loaded at once) + Whisper (about 255 MB, loaded only when a recording contains speech). */
+    private class Engine(private val app: JarvisApp, private val threads: Int) : AutoCloseable {
         private val env = OrtEnvironment.getEnvironment()
-        private val whisper: WhisperModel
-        private val vad: SileroVad
-        val transcriber: SpeechTranscriber
+        private var whisper: WhisperModel? = null
+        private val vad: SileroVad = SileroVad(env, app.assets.open("models/silero_vad.onnx").use { it.readBytes() })
+        val transcriber = SpeechTranscriber({ whisper() }, vad, app.prefs.vadThreshold)
+        val whisperLoaded get() = whisper != null
 
-        init {
-            val mel = WhisperMel(WhisperMel.loadFilters(app.assets.open("$MODEL_DIR/mel_filters_80.bin").use { it.readBytes() }))
-            val tokens = app.assets.open("$MODEL_DIR/small-tokens.txt").bufferedReader().use { it.readLines() }
-            whisper = WhisperModel(env, asset(app, "$MODEL_DIR/small-encoder.int8.onnx"), asset(app, "$MODEL_DIR/small-decoder.jarvis.onnx"),
-                tokens, threads, mel)
-            vad = SileroVad(env, app.assets.open("models/silero_vad.onnx").use { it.readBytes() })
-            transcriber = SpeechTranscriber(whisper, vad, app.prefs.vadThreshold)
+        private fun whisper(): WhisperModel {
+            whisper?.let { return it }
+            val t0 = System.currentTimeMillis()
+            val was = current
+            current = "loading the speech recognizer…"
+            try {
+                val mel = WhisperMel(WhisperMel.loadFilters(app.assets.open("$MODEL_DIR/mel_filters_80.bin").use { it.readBytes() }))
+                val tokens = app.assets.open("$MODEL_DIR/small-tokens.txt").bufferedReader().use { it.readLines() }
+                val w = WhisperModel(env, asset(app, "$MODEL_DIR/small-encoder.int8.onnx"), asset(app, "$MODEL_DIR/small-decoder.jarvis.onnx"),
+                    tokens, threads, mel)
+                whisper = w
+                app.store.log("TRANSCRIPTION_ENGINE_LOADED", "${System.currentTimeMillis() - t0} ms, $threads threads",
+                    JSONObject().put("engine", ENGINE).put("engineId", ENGINE_ID).put("threads", threads).put("loadMs", System.currentTimeMillis() - t0))
+                return w
+            } catch (t: Throwable) {
+                engineProblem = t.toString()
+                app.store.log("TRANSCRIPTION_ENGINE_FAILED", t.toString(), JSONObject().put("stack", t.stackTraceToString().take(4000)))
+                throw EngineUnavailable(t.toString())
+            } finally {
+                current = was
+            }
         }
 
         /** Memory-maps an uncompressed asset straight from the APK (no copy on disk); falls back to reading it. */
@@ -213,7 +229,7 @@ object Transcription {
         }
 
         override fun close() {
-            runCatching { whisper.close() }
+            runCatching { whisper?.close() }
             runCatching { vad.close() }
         }
     }
@@ -221,29 +237,21 @@ object Transcription {
     private fun engine(): Engine {
         engine?.let { return it }
         val threads = Runtime.getRuntime().availableProcessors().let { (it / 2).coerceIn(2, 4) }
-        val t0 = System.currentTimeMillis()
-        val was = current
-        current = "loading the speech recognizer…"
         try {
-            val e = Engine(app, threads)
-            engine = e
-            engineProblem = null
-            app.store.log("TRANSCRIPTION_ENGINE_LOADED", "${System.currentTimeMillis() - t0} ms, $threads threads",
-                JSONObject().put("engine", ENGINE).put("engineId", ENGINE_ID).put("threads", threads).put("loadMs", System.currentTimeMillis() - t0))
-            return e
+            return Engine(app, threads).also { engine = it }
         } catch (t: Throwable) {
             engineProblem = t.toString()
             app.store.log("TRANSCRIPTION_ENGINE_FAILED", t.toString(), JSONObject().put("stack", t.stackTraceToString().take(4000)))
             throw EngineUnavailable(t.toString())
-        } finally {
-            current = was
         }
     }
 
     private fun releaseEngine(why: String) {
-        engine?.close()
+        val e = engine ?: return
+        val hadWhisper = e.whisperLoaded
+        e.close()
         engine = null
-        app.store.log("TRANSCRIPTION_ENGINE_RELEASED", why)
+        if (hadWhisper) app.store.log("TRANSCRIPTION_ENGINE_RELEASED", why)
     }
 
     private fun transcribe(r: DiagStore.RecordingRow, variant: String, audio: Pair<ShortArray, Int>?, audioName: String, extra: JSONObject?) {
@@ -303,7 +311,8 @@ object Transcription {
         }
         return JSONObject().put("engine", ENGINE).put("engineId", ENGINE_ID).put("languagesAllowed", JSONArray(LANGUAGES))
             .put("sampleRate", sr).put("audioMs", t.audioMs).put("speechMs", t.speechMs)
-            .put("maxSpeechProbability", r3(t.maxSpeechProb.toDouble())).put("processingMs", t.processingMs)
+            .put("maxSpeechProbability", r3(t.maxSpeechProb.toDouble())).put("maxLevelDbfs", Math.round(t.maxLevelDb * 10) / 10.0)
+            .put("processingMs", t.processingMs)
             .put("languageProbabilities", JSONObject(t.languageProbs.mapValues { r3(it.value) }))
             .put("chunks", chunks).put("notes", JSONArray(notes(t)))
     }
@@ -315,7 +324,9 @@ object Transcription {
     private fun notes(t: SpeechTranscriber.Transcript): List<String> {
         val n = ArrayList<String>()
         if (t.chunks.isEmpty()) {
-            n.add("the voice detector found no speech (highest speech probability ${pct(t.maxSpeechProb.toDouble())}); the audio was not sent to the recognizer")
+            n.add(if (t.maxLevelDb < SpeechTranscriber.MIN_SPEECH_DBFS)
+                "the audio is too quiet to contain speech (loudest moment %.0f dBFS); it was not sent to the recognizer".format(t.maxLevelDb)
+            else "the voice detector found no speech (highest speech probability ${pct(t.maxSpeechProb.toDouble())}); the audio was not sent to the recognizer")
             return n
         }
         if (!t.hasText) n.add("the recognizer returned no words")
@@ -429,7 +440,7 @@ object Transcription {
         }
         val notes = info?.optJSONArray("notes")
         if (notes != null && notes.length() > 0) {
-            for (i in 0 until notes.length()) sb.append(p).append(if (i == 0) "Uncertain:  " else "            ").append(notes.getString(i)).append('\n')
+            for (i in 0 until notes.length()) sb.append(p).append(if (i == 0) "Notes:      " else "            ").append(notes.getString(i)).append('\n')
         }
     }
 

@@ -57,6 +57,32 @@ class WhisperTest {
         }
     }
 
+    /** Near-silent digital noise (like an idle emulator microphone) fools Silero VAD; the level floor must reject it. */
+    @Test fun nearSilentNoiseIsNotSpeech() {
+        model().use { w ->
+            SileroVad(OrtEnvironment.getEnvironment(), File(models, "silero_vad.onnx").readBytes()).use { vad ->
+                val tr = SpeechTranscriber(w, vad)
+                val rnd = java.util.Random(3)
+                val synthetic = ShortArray(44100 * 6) { if (rnd.nextDouble() < 0.13) (rnd.nextInt(15) - 7).toShort() else 0 }
+                val clips = listOf("synthetic" to (synthetic to 44100)) +
+                    listOfNotNull(File(testdata, "quiet_emulator_mic.wav").takeIf { it.exists() }?.let { "emulator" to Wav.read(it) })
+                for ((name, a) in clips) {
+                    val t = tr.transcribe(a.first, a.second, listOf("da", "en"))
+                    println("$name: loudest %.1f dBFS, chunks %d".format(t.maxLevelDb, t.chunks.size))
+                    assertEquals(0, t.chunks.size)
+                }
+                // ...while normal speech (about -30 dBFS) still passes
+                File(testdata, "whisper_en1_phone.wav").takeIf { it.exists() }?.let { f ->
+                    val (pcm, sr) = Wav.read(f)
+                    val t = tr.transcribe(pcm, sr, listOf("da", "en"))
+                    println("speech: loudest %.1f dBFS, chunks %d, text: %s".format(t.maxLevelDb, t.chunks.size, t.text))
+                    assertEquals(1, t.chunks.size)
+                    assertTrue(t.hasText)
+                }
+            }
+        }
+    }
+
     @Test fun matchesPythonReference() {
         val clips = testdata.listFiles { f -> f.name.startsWith("whisper_") && f.name.endsWith(".wav") }?.sortedBy { it.name }.orEmpty()
         assumeTrue("no whisper test clips", clips.isNotEmpty())
