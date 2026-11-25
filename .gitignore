@@ -8,3 +8,8 @@ captures/
 .DS_Store
 *.apk
 !gradle/wrapper/gradle-wrapper.jar
+
+# Whisper model (downloaded by tools/whisper/fetch_model.sh)
+.whisper-cache/
+app/src/main/assets/models/whisper/*.onnx
+app/src/main/assets/models/whisper/small-tokens.txt

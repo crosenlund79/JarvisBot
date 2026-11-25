@@ -84,6 +84,7 @@ class MainActivity : Activity() {
     private var storageText: TextView? = null
     private var imageText: TextView? = null
     private var exportText: TextView? = null
+    private var transcriptText: TextView? = null
     private var micInterrupted: String? = null
     private var micStartRequestedTs = 0L
     private var pendingMicStart = false
@@ -156,6 +157,20 @@ class MainActivity : Activity() {
             override fun onNothingSelected(p: AdapterView<*>?) {}
         }
     }
+    private fun viewTranscription() {
+        val days = store.transcriptDays()
+        if (days.isEmpty()) { toast("No transcriptions yet"); return }
+        AlertDialog.Builder(this).setTitle("Daily transcription").setItems(days.map { Transcription.fileName(it) }.toTypedArray()) { _, w ->
+            val text = runCatching { Transcription.render(days[w]) }.getOrElse { "Could not read: $it" }
+            val view = TextView(this).apply {
+                this.text = text; textSize = 12f; typeface = Typeface.MONOSPACE; setTextIsSelectable(true)
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+            }
+            AlertDialog.Builder(this).setTitle(Transcription.fileName(days[w])).setView(ScrollView(this).apply { addView(view) })
+                .setPositiveButton("Close", null).show()
+        }.show()
+    }
+
     private fun info(title: String, msg: String) {
         AlertDialog.Builder(this).setTitle(title).setMessage(msg).setPositiveButton("OK", null).show()
     }
@@ -230,6 +245,22 @@ class MainActivity : Activity() {
             else confirm("Stop copying new recordings to ${SyncFolder.label()}? Files already there are kept.") { SyncFolder.disable(this); updateTexts() }
         }))
 
+        // Transcription
+        l.addView(header("Transcription (Danish / English, offline)"))
+        l.addView(RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
+            Transcription.MODES.forEachIndexed { i, (key, label) ->
+                addView(RadioButton(this@MainActivity).apply { id = 2000 + i; text = label; isChecked = prefs.transcriptionMode == key })
+            }
+            setOnCheckedChangeListener { _, checkedId ->
+                val m = Transcription.MODES[checkedId - 2000].first
+                if (m != prefs.transcriptionMode) { prefs.transcriptionMode = m; Transcription.modeChanged(); updateTexts() }
+            }
+        })
+        transcriptText = tv("", 13f)
+        l.addView(transcriptText)
+        l.addView(btn("View daily transcription…") { viewTranscription() })
+
         // Export
         l.addView(header("Export (ZIP with recordings + diagnostic logs)"))
         val modes = listOf("RAW" to "Raw audio (original)", "ENHANCED" to "Voice-enhanced audio", "BOTH" to "Both raw and voice-enhanced")
@@ -284,6 +315,8 @@ class MainActivity : Activity() {
                 (if (SyncFolder.lastCopyTs > 0) "\nLast copy: ${fmtTs(SyncFolder.lastCopyTs)}" else "") +
                 (if (SyncFolder.folderFiles >= 0) "\nIn folder: ${SyncFolder.folderFiles} Jarvis files, ${mb(SyncFolder.folderBytes)} (max ${mb(SyncFolder.CAP_BYTES)})" else "")
         }
+        transcriptText?.text = runCatching { Transcription.statusText() }.getOrElse { "Status unavailable: $it" } +
+            "\nDaily files: one per day (e.g. ${Transcription.fileName(Transcription.dayOf(System.currentTimeMillis()))}), copied to the sync folder and included in exports."
         val stat = StatFs(filesDir.path)
         storageText?.text = "On this phone: ${mb(store.audioBytes())} audio (limit ${mb(prefs.storageLimitMb * 1048576L)}, oldest deleted automatically), " +
             "${mb(store.dbFileBytes())} logs. Free: %.1f GB".format(stat.availableBytes / 1e9)
@@ -334,6 +367,7 @@ class MainActivity : Activity() {
                 1 -> confirm("Delete ALL recordings, recognitions and logs on this phone? This cannot be undone.") {
                     stopPlayback()
                     store.deleteAll()
+                    Transcription.clearLocalFiles()
                     store.log("USER_DELETED_ALL_DATA", "")
                     toast("All local recordings and logs deleted"); refreshHistory(true); updateTexts()
                 }

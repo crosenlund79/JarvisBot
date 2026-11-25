@@ -20,6 +20,7 @@ dependencies {
     compileOnly("com.microsoft.onnxruntime:onnxruntime:$ortVersion")
     testImplementation("com.microsoft.onnxruntime:onnxruntime:$ortVersion")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
 
 tasks.test {

@@ -815,6 +815,7 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
                 )
                 store.insertRecording(row)
                 SyncFolder.publish(row)
+                Transcription.onRecordingSaved(row)
                 store.log("RECORDING_SAVED", "$kind${category?.let { "/$it" } ?: ""} ${samples.size * 1000L / SR} ms",
                     JSONObject().put("file", name).put("bytes", f.length()), interactionId, recId)
                 val (n, freed) = store.enforceStorageLimit(prefs.storageLimitMb.toLong() * 1024 * 1024)

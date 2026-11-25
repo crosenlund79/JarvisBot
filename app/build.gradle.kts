@@ -79,3 +79,13 @@ dependencies {
     implementation(project(":core"))
     implementation("com.microsoft.onnxruntime:onnxruntime-android:$ortVersion")
 }
+
+// The offline speech-recognition model is not in git (too large); tools/whisper/fetch_model.sh downloads it.
+val whisperDir: File = file("src/main/assets/models/whisper")
+tasks.named("preBuild") {
+    doFirst {
+        val missing = listOf("small-encoder.int8.onnx", "small-decoder.jarvis.onnx", "small-tokens.txt", "mel_filters_80.bin")
+            .filter { !File(whisperDir, it).exists() }
+        if (missing.isNotEmpty()) throw GradleException("Whisper model files missing $missing – run tools/whisper/fetch_model.sh first")
+    }
+}

@@ -54,6 +54,30 @@ Choose *Voice-enhanced* or *Both* before exporting. Each enhanced copy is comput
 
 Files have matching names (`…_raw.wav`, `…_enhanced.wav`, `…_diagnostics.json`), and the JSON records the method and its measurements. If enhancement fails, the original is exported instead and the failure is reported. Original recordings are never modified.
 
+### Daily transcription
+One setting on the main screen, under *Transcription*:
+* **Off**
+* **Automatic**: every completed recording is transcribed in the background, newest first.
+* **During export only**: transcription happens when you make a ZIP.
+
+Recognition is fully offline: OpenAI's **Whisper small** (multilingual), int8 ONNX, bundled in the APK (about 255 MB). It recognises Danish and English and picks the more likely of the two for each piece of speech.
+1. Silero VAD first looks for speech. Audio without speech is never sent to Whisper (Whisper tends to invent text for noise) and is listed as **[NO SPEECH RECOGNIZED]**.
+2. Long recordings are cut at quiet points into chunks of at most 20 s.
+3. Each chunk is decoded greedily without timestamps. The text is exactly what the engine produced.
+
+Results go into one UTF-8 file per day, named after the recording's own date: `2026-11-25_Transcription.txt`.
+* Entries are in recording order.
+* Each entry has the start/end time and the audio file name (as in the sync folder and ZIP), plus the language and the recognised text.
+* An entry also shows the voice-enhanced transcription if one was made, and uncertainty notes: low confidence, possibly not speech, language unsure, repetitive output, errors.
+* Reprocessing replaces an entry; it never adds a second one.
+* The daily file is copied to the sync folder (complete before it appears, at most every 2 min while busy) and included in ZIP exports (`transcripts/`).
+* An enhanced transcription is made when you export with *Voice-enhanced* or *Both*, because enhanced audio only exists during an export.
+* **View daily transcription…** shows a file on the phone.
+
+Transcription runs on one low-priority background thread and never touches the microphone. The model is loaded on demand and released after 5 min idle.
+
+To build locally, first run `tools/whisper/fetch_model.sh`. It downloads the model at a pinned revision, verifies its checksums, and shrinks the decoder for the phone (`tools/whisper/shrink_decoder.py`). CI does the same.
+
 ## First start (wake word)
 
 1. Open **Jarvis Proto 001** and grant **Microphone** and **Notifications**.

@@ -7,6 +7,7 @@ import android.os.Build
 import android.provider.DocumentsContract
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.io.OutputStream
 import java.text.SimpleDateFormat
@@ -73,6 +74,7 @@ object SyncFolder {
         ok = null; problem = ""; needsCatchUp = true
         app.store.log("SYNC_FOLDER_SELECTED", label(), JSONObject().put("uri", treeUri.toString()))
         exec.execute { check(); refreshUsage(prune = false) }
+        Transcription.publishAllDays()
     }
 
     fun disable(ctx: Context) {
@@ -134,7 +136,48 @@ object SyncFolder {
         }
     }
 
+    /** Daily transcription file: replaces the previous version in the folder (written completely before it appears). */
+    fun publishTranscript(file: File) {
+        if (!isConfigured() || !file.exists()) return
+        val bytes = file.readBytes()
+        exec.execute {
+            val dir = dirUri() ?: return@execute
+            try {
+                writeReplacing(dir, file.name) { it.write(bytes) }
+                markOk()
+            } catch (e: Exception) {
+                fail("transcription file", e)
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ internals (sync thread)
+
+    /** Like [writeAtomic], but an existing file of the same name is removed just before the complete new one is renamed. */
+    private fun writeReplacing(dir: Uri, finalName: String, body: (OutputStream) -> Unit) {
+        val cr = app.contentResolver
+        val tmp = runCatching { DocumentsContract.createDocument(cr, dir, "application/octet-stream", ".$finalName.partial") }.getOrNull()
+            ?: throw IOException("could not create a file in the sync folder")
+        try {
+            (cr.openOutputStream(tmp, "w") ?: throw IOException("could not open $finalName for writing")).use { body(it) }
+            for (old in childrenNamed(finalName)) runCatching { DocumentsContract.deleteDocument(cr, old) }
+            DocumentsContract.renameDocument(cr, tmp, finalName) ?: throw IOException("rename to $finalName failed")
+        } catch (e: Exception) {
+            runCatching { DocumentsContract.deleteDocument(cr, tmp) }
+            throw e
+        }
+    }
+
+    private fun childrenNamed(name: String): List<Uri> {
+        val tree = Uri.parse(app.prefs.syncTreeUri)
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
+        val res = ArrayList<Uri>()
+        app.contentResolver.query(children, arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+            null, null, null)?.use { c ->
+            while (c.moveToNext()) if (c.getString(1) == name) res.add(DocumentsContract.buildDocumentUriUsingTree(tree, c.getString(0)))
+        }
+        return res
+    }
 
     private fun dirUri(): Uri? {
         val s = app.prefs.syncTreeUri
@@ -287,6 +330,12 @@ object SyncFolder {
             .put("recording", r.toJson())
             .put("events", events)
             .put("recognitions", recognitions)
+            .put("transcription", JSONObject().also { o ->
+                for (v in listOf("RAW", "ENHANCED")) store.transcript(r.id, v)?.let { t ->
+                    o.put(v.lowercase(), JSONObject().put("status", t.status).put("language", t.language).put("text", t.text)
+                        .put("audio", t.audioName).put("details", t.info?.let { runCatching { JSONObject(it) }.getOrNull() }))
+                }
+            })
             .put("app", appInfo())
             .put("device", deviceLine())
     }

@@ -92,6 +92,7 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
                     durationMs = dataBytes / 2 * 1000 / r.sampleRate, meta = meta.toString())
                 store.insertRecording(fixed)
                 SyncFolder.publish(fixed)
+                Transcription.onRecordingSaved(fixed)
                 store.log("MICTEST_FILE_RECOVERED", "${r.file}: session was killed while recording; file kept (${dataBytes / 2 * 1000 / r.sampleRate} ms)",
                     JSONObject().put("bytes", f.length()), interactionId = r.interactionId, recordingId = r.id)
             }
@@ -647,7 +648,10 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             )
             store.runOnWriter {
                 store.insertRecording(row)
-                if (closeReason != null) SyncFolder.publish(row) // completed: copy to the sync folder (if configured)
+                if (closeReason != null) {
+                    SyncFolder.publish(row) // completed: copy to the sync folder (if configured)
+                    Transcription.onRecordingSaved(row)
+                }
             }
         }
     }

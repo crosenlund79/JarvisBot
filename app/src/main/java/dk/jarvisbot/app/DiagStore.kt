@@ -351,6 +351,105 @@ class DiagStore(private val ctx: Context) : SQLiteOpenHelper(ctx, "jarvis_diag.d
         return rows.size to bytes
     }
 
+    // ------------------------------------------------------------------ transcriptions (one row per recording and audio variant)
+
+    data class TranscriptRow(
+        val recordingId: String, val variant: String, val day: String, val tsStart: Long, val tsEnd: Long,
+        val audioName: String, val kind: String, val category: String?, val durationMs: Long,
+        /** SPEECH, NO_SPEECH or ERROR */
+        val status: String, val language: String?, val text: String?, val info: String?, val engine: String, val processedTs: Long,
+    )
+
+    @Volatile private var transcriptTableReady = false
+
+    private fun ensureTranscriptTable() {
+        if (transcriptTableReady) return
+        writableDatabase.execSQL(
+            """CREATE TABLE IF NOT EXISTS transcripts(recording_id TEXT NOT NULL, variant TEXT NOT NULL, day TEXT NOT NULL,
+               ts_start INTEGER, ts_end INTEGER, audio_name TEXT, kind TEXT, category TEXT, duration_ms INTEGER, status TEXT,
+               language TEXT, text TEXT, info TEXT, engine TEXT, processed_ts INTEGER, PRIMARY KEY(recording_id, variant))"""
+        )
+        writableDatabase.execSQL("CREATE INDEX IF NOT EXISTS tr_day ON transcripts(day, ts_start)")
+        transcriptTableReady = true
+    }
+
+    /** Insert or replace: reprocessing a recording never creates a second entry. */
+    fun upsertTranscript(t: TranscriptRow) {
+        ensureTranscriptTable()
+        writableDatabase.insertWithOnConflict("transcripts", null, ContentValues().apply {
+            put("recording_id", t.recordingId); put("variant", t.variant); put("day", t.day); put("ts_start", t.tsStart)
+            put("ts_end", t.tsEnd); put("audio_name", t.audioName); put("kind", t.kind); put("category", t.category)
+            put("duration_ms", t.durationMs); put("status", t.status); put("language", t.language); put("text", t.text)
+            put("info", t.info); put("engine", t.engine); put("processed_ts", t.processedTs)
+        }, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    private val trCols = "recording_id, variant, day, ts_start, ts_end, audio_name, kind, category, duration_ms, status, language, text, info, engine, processed_ts"
+
+    private fun trFrom(c: Cursor) = TranscriptRow(
+        c.getString(0), c.getString(1), c.getString(2), c.getLong(3), c.getLong(4), c.getString(5) ?: "", c.getString(6) ?: "",
+        c.getString(7), c.getLong(8), c.getString(9) ?: "ERROR", c.getString(10), c.getString(11), c.getString(12), c.getString(13) ?: "",
+        c.getLong(14)
+    )
+
+    fun transcript(recordingId: String, variant: String): TranscriptRow? {
+        ensureTranscriptTable()
+        return readableDatabase.rawQuery("SELECT $trCols FROM transcripts WHERE recording_id=? AND variant=?", arrayOf(recordingId, variant))
+            .use { c -> if (c.moveToFirst()) trFrom(c) else null }
+    }
+
+    fun transcriptsForDay(day: String): List<TranscriptRow> {
+        ensureTranscriptTable()
+        val res = ArrayList<TranscriptRow>()
+        readableDatabase.rawQuery("SELECT $trCols FROM transcripts WHERE day=? ORDER BY ts_start, recording_id, variant DESC", arrayOf(day))
+            .use { c -> while (c.moveToNext()) res.add(trFrom(c)) }
+        return res
+    }
+
+    fun allTranscripts(): List<TranscriptRow> {
+        ensureTranscriptTable()
+        val res = ArrayList<TranscriptRow>()
+        readableDatabase.rawQuery("SELECT $trCols FROM transcripts ORDER BY ts_start, recording_id, variant DESC", null)
+            .use { c -> while (c.moveToNext()) res.add(trFrom(c)) }
+        return res
+    }
+
+    fun transcriptDays(): List<String> {
+        ensureTranscriptTable()
+        val res = ArrayList<String>()
+        readableDatabase.rawQuery("SELECT DISTINCT day FROM transcripts ORDER BY day DESC", null).use { c -> while (c.moveToNext()) res.add(c.getString(0)) }
+        return res
+    }
+
+    private val transcribable = "COALESCE(category,'') NOT IN ('RECORDING','EMPTY')"
+
+    /** Newest completed recording without a transcription of its original audio. */
+    fun nextUntranscribed(): RecordingRow? {
+        ensureTranscriptTable()
+        return readableDatabase.rawQuery(
+            "SELECT $recCols FROM recordings WHERE $transcribable AND id NOT IN (SELECT recording_id FROM transcripts WHERE variant='RAW') " +
+                "ORDER BY ts_start DESC LIMIT 1", null
+        ).use { c -> if (c.moveToFirst()) recFrom(c) else null }
+    }
+
+    fun countUntranscribed(): Long {
+        ensureTranscriptTable()
+        return count("SELECT COUNT(*) FROM recordings WHERE $transcribable AND id NOT IN (SELECT recording_id FROM transcripts WHERE variant='RAW')")
+    }
+
+    /** (transcribed, with speech, without speech, errors) for one day, original audio only. */
+    fun transcriptCounts(day: String): IntArray {
+        ensureTranscriptTable()
+        val r = IntArray(4)
+        readableDatabase.rawQuery("SELECT status, COUNT(*) FROM transcripts WHERE day=? AND variant='RAW' GROUP BY status", arrayOf(day)).use { c ->
+            while (c.moveToNext()) {
+                val n = c.getInt(1); r[0] += n
+                when (c.getString(0)) { "SPEECH" -> r[1] += n; "NO_SPEECH" -> r[2] += n; else -> r[3] += n }
+            }
+        }
+        return r
+    }
+
     // ------------------------------------------------------------------ misc
 
     fun count(sql: String): Long = readableDatabase.rawQuery(sql, null).use { c -> if (c.moveToFirst()) c.getLong(0) else 0 }
@@ -368,6 +467,7 @@ class DiagStore(private val ctx: Context) : SQLiteOpenHelper(ctx, "jarvis_diag.d
         db.delete("recognitions", null, null)
         db.delete("events", null, null)
         runCatching { db.delete("synced", null, null) }
+        runCatching { db.delete("transcripts", null, null) }
         audioDir.listFiles()?.forEach { it.delete() }
         runCatching { db.execSQL("VACUUM") }
     }

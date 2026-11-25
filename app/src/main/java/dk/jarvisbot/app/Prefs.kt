@@ -62,6 +62,8 @@ class Prefs(ctx: Context) {
     var syncSinceTs: Long get() = l("syncSinceTs", 0); set(v) = sp.edit().putLong("syncSinceTs", v).apply()
     /** RAW, ENHANCED or BOTH – audio included in a manual diagnostic export. */
     var exportAudioMode: String get() = s("exportAudioMode", "RAW"); set(v) = sp.edit().putString("exportAudioMode", v).apply()
+    /** OFF, AUTO (each completed recording) or EXPORT (only when a diagnostic ZIP is made). */
+    var transcriptionMode: String get() = s("transcriptionMode", "AUTO"); set(v) = sp.edit().putString("transcriptionMode", v).apply()
     /** Display name of the image chosen for "Show Image" (the image itself is copied into app storage). */
     var displayImageName: String get() = s("displayImageName", ""); set(v) = sp.edit().putString("displayImageName", v).apply()
     /** True while a microphone test should be running (survives process death so interruptions can be reported). */

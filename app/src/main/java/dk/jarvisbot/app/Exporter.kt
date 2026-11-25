@@ -34,7 +34,10 @@ object Exporter {
         var audioFiles = 0
         var enhancedOk = 0
         var enhanceFailed = 0
+        var transcriptDays = 0
         var events = 0
+        // Transcribe what is still missing first (mode Automatic / During export only), so the logs below include it.
+        val transcriptionProblem = Transcription.prepareExport(store.recordings(null, Int.MAX_VALUE).filter { it.category != "RECORDING" }, progress)
         ZipOutputStream(out.buffered()).use { zip ->
             fun text(name: String, content: String) {
                 zip.putNextEntry(ZipEntry(name)); zip.write(content.toByteArray(Charsets.UTF_8)); zip.closeEntry()
@@ -146,6 +149,8 @@ object Exporter {
                             stored(zip, "audio/$enhName", bytes)
                             enhInfo = JSONObject(res.info as Map<*, *>).put("status", "OK")
                             enhancedOk++
+                            progress("Exporting $i / ${recs.size} (transcribing the voice-enhanced audio)")
+                            Transcription.transcribeEnhanced(r, res.samples, sr, enhName, SpeechEnhancer.METHOD)
                         } catch (t: Throwable) {
                             enhanceFailed++
                             enhInfo = JSONObject().put("method", SpeechEnhancer.METHOD).put("status", "FAILED")
@@ -163,11 +168,22 @@ object Exporter {
                     audioFiles++
                 }
             }
+
+            // daily transcription files + one table of all transcriptions
+            progress("Writing transcriptions…")
+            for ((name, content) in Transcription.dailyFilesForExport()) { text("transcripts/$name", content); transcriptDays++ }
+            text("transcripts/transcripts.csv", csv(
+                listOf("recording_id", "variant", "day", "start_iso", "end_iso", "audio_file", "kind", "category", "duration_ms", "status", "language", "text", "details"),
+                store.allTranscripts().map { listOf(it.recordingId, it.variant, it.day, DiagStore.iso(it.tsStart), DiagStore.iso(it.tsEnd), it.audioName,
+                    it.kind, it.category, it.durationMs, it.status, it.language, it.text, it.info) }
+            ))
         }
-        val summary = "Exported $audioFiles recording(s)" +
+        val summary = "Exported $audioFiles recording(s), $transcriptDays daily transcription file(s)" +
+            (transcriptionProblem?.let { " ($it)" } ?: "") +
             (if (audioMode == "ENHANCED" || audioMode == "BOTH") ", $enhancedOk voice-enhanced" + (if (enhanceFailed > 0) ", $enhanceFailed enhancement FAILED (original included)" else "") else "") +
             ", $events events"
-        store.log("EXPORT_CREATED", summary, JSONObject().put("audioMode", audioMode).put("enhancedOk", enhancedOk).put("enhanceFailed", enhanceFailed))
+        store.log("EXPORT_CREATED", summary, JSONObject().put("audioMode", audioMode).put("enhancedOk", enhancedOk).put("enhanceFailed", enhanceFailed)
+            .put("transcriptionMode", app.prefs.transcriptionMode).put("transcriptDays", transcriptDays).put("transcriptionProblem", transcriptionProblem))
         return summary
     }
 
@@ -222,6 +238,12 @@ object Exporter {
         MICTEST_MIC_OPENED / MIC_OPEN_FAILED (every configuration tried), MICTEST_STATUS every 5 s (samples arriving?,
         % of expected samples, level, all-zero?), MICTEST_NO_AUDIO, MICTEST_ONLY_ZEROS, MICTEST_READ_ERROR, MICTEST_MIC_RESTART,
         MICTEST_INTERRUPTED, plus service/heartbeat/screen events.
+
+        TRANSCRIPTIONS: transcripts/<yyyy-MM-dd>_Transcription.txt = one readable UTF-8 file per day (by recording date),
+        chronological, with start/end time, audio file name, language, the recognised text exactly as produced, the
+        voice-enhanced transcription if one was made, and uncertainty / errors. Recognizer: ${Transcription.ENGINE}.
+        transcripts/transcripts.csv = the same as a table, with all technical details (per-chunk language probabilities,
+        no-speech probability, average log-probability, timings).
 
         All timestamps: epoch milliseconds (ts) plus ISO-8601 local time (iso).
         interaction_id links one wake activation -> WAKE clip -> COMMAND recording -> recognition(s).
