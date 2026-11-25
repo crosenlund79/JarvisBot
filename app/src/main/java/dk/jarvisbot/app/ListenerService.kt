@@ -306,15 +306,15 @@ class ListenerService : Service(), AudioPipeline.Listener {
             val mine = configs.firstOrNull { it.clientAudioSessionId == mineId }
             val others = configs.filter { it.clientAudioSessionId != mineId }
             val silenced = if (Build.VERSION.SDK_INT >= 29 && mine != null) mine.isClientSilenced else null
-            if (silenced != null && silenced != lastSilenced) {
+            if (silenced != null && silenced != lastSilenced && !(lastSilenced == null && !silenced)) {
                 app.store.log(
                     if (silenced) "MIC_CLIENT_SILENCED" else "MIC_CLIENT_UNSILENCED",
                     if (silenced) "Android silenced our capture (another app or a call took the microphone)" else "Our capture is no longer silenced",
                     JSONObject().put("otherClients", others.size)
                 )
-                LiveStatus.micSilencedByOs = silenced
                 updateNotification(force = true)
             }
+            if (silenced != null) LiveStatus.micSilencedByOs = silenced
             lastSilenced = silenced
             if (others.size != lastOtherClients) {
                 if (others.size > lastOtherClients && lastOtherClients >= 0) LiveStatus.otherClientStarts++

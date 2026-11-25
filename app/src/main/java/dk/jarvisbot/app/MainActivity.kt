@@ -26,7 +26,6 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ProgressBar
@@ -74,14 +73,17 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         app = application as JarvisApp
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; fitsSystemWindows = true }
-        val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        for (t in listOf("Control", "Recordings", "Commands", "Events", "Settings", "Export")) {
-            tabs.addView(Button(this).apply {
-                text = t; isAllCaps = false; textSize = 13f
-                setOnClickListener { showTab(t) }
-            })
+        // Two rows of three tabs so every tab is always reachable on narrow phone screens.
+        for (rowTabs in listOf(listOf("Control", "Recordings", "Commands"), listOf("Events", "Settings", "Export"))) {
+            val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            for (t in rowTabs) {
+                tabs.addView(Button(this).apply {
+                    text = t; isAllCaps = false; textSize = 13f; minWidth = 0; minimumWidth = 0
+                    setOnClickListener { showTab(t) }
+                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            }
+            root.addView(tabs)
         }
-        root.addView(HorizontalScrollView(this).apply { addView(tabs) })
         content = FrameLayout(this)
         root.addView(content, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
@@ -387,7 +389,7 @@ class MainActivity : Activity() {
 
     private fun recordingActions(r: DiagStore.RecordingRow, refresh: () -> Unit) {
         val actions = listOf(
-            "Play", "Stop", "Recognize now (${prefs.language})",
+            "Play", "Stop", "Recognize now (${prefs.language})", "Analyze with wake engine (offline)",
             "Label MISSED_WAKE (I said Hey Jarvis, it did not trigger)",
             "Label FALSE_WAKE (triggered but I did not say it)",
             "Label CORRECT_WAKE", "Label NOT_WAKE (correctly ignored)", "Clear label", "Add note…", "Details (JSON)", "Delete"
@@ -397,18 +399,25 @@ class MainActivity : Activity() {
                 0 -> play(r)
                 1 -> stopPlayback()
                 2 -> { Recognition.enqueue(r.id, r.interactionId, "MANUAL", prefs.language); toast("Recognizing…") }
-                3, 4, 5, 6 -> {
-                    val label = listOf("MISSED_WAKE", "FALSE_WAKE", "CORRECT_WAKE", "NOT_WAKE")[which - 3]
+                3 -> {
+                    toast("Analyzing…")
+                    Thread {
+                        val res = runCatching { OfflineAnalyzer.analyze(app, r) }.getOrElse { "Analysis failed: $it" }
+                        runOnUiThread { info("Wake engine analysis", res) }
+                    }.start()
+                }
+                4, 5, 6, 7 -> {
+                    val label = listOf("MISSED_WAKE", "FALSE_WAKE", "CORRECT_WAKE", "NOT_WAKE")[which - 4]
                     store.setRecordingLabel(r.id, label, null)
                     if ((label == "FALSE_WAKE" || label == "CORRECT_WAKE") && r.interactionId != null) store.labelInteraction(r.interactionId, label)
                     store.log("USER_LABEL", label, JSONObject().put("kind", r.kind).put("category", r.category).put("maxWakeScore", r.maxScore),
                         r.interactionId, r.id)
                     refresh()
                 }
-                7 -> { store.setRecordingLabel(r.id, null, null); store.log("USER_LABEL", "cleared", recordingId = r.id); refresh() }
-                8 -> editText("Note", r.note ?: "") { store.setRecordingLabel(r.id, r.label, it); refresh() }
-                9 -> info(r.id, r.toJson().toString(2))
-                10 -> confirm("Delete ${r.file}?") { store.deleteRecording(r.id); store.log("USER_DELETED_RECORDING", r.file, recordingId = r.id); refresh() }
+                8 -> { store.setRecordingLabel(r.id, null, null); store.log("USER_LABEL", "cleared", recordingId = r.id); refresh() }
+                9 -> editText("Note", r.note ?: "") { store.setRecordingLabel(r.id, r.label, it); refresh() }
+                10 -> info(r.id, r.toJson().toString(2))
+                11 -> confirm("Delete ${r.file}?") { store.deleteRecording(r.id); store.log("USER_DELETED_RECORDING", r.file, recordingId = r.id); refresh() }
             }
         }.show()
     }

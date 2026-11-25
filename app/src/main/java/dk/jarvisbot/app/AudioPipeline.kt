@@ -82,8 +82,9 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
 
     // engines
     private var env: OrtEnvironment? = null
-    private var wake: WakeWordEngine? = null
-    private var vad: SileroVad? = null
+    // Loaded on a background thread so the microphone (and all mic diagnostics) start immediately.
+    @Volatile private var wake: WakeWordEngine? = null
+    @Volatile private var vad: SileroVad? = null
     private var wakeErrors = 0L
     private var vadErrors = 0L
 
@@ -158,6 +159,9 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
     private var zeroStartTs = 0L
     private var clockBaseWall = 0L
     private var clockSamples = 0L
+    private var lastGapLogTs = 0L
+    private var gapCount = 0
+    private var gapTotalMs = 0L
 
     val hasActiveCapture: Boolean get() = manual != null || raw != null
 
@@ -216,8 +220,11 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
             .put("speechChunksInWindow", speech).put("thresholdAtTime", cfg.threshold)
         val id = DiagStore.newId("miss")
         store.log(
-            "USER_MARKED_MISSED", "max wake score in last ${samples.size / SR}s = %.3f".format(maxScore),
-            JSONObject().put("maxWakeScore", maxScore.toDouble()).put("speechChunks", speech).put("threshold", cfg.threshold.toDouble()),
+            "USER_MARKED_MISSED",
+            if (maxScore < 0f) "wake engine was NOT running during the last ${samples.size / SR}s (not loaded / failed)"
+            else "max wake score in last ${samples.size / SR}s = %.3f (threshold %.2f)".format(maxScore, cfg.threshold),
+            JSONObject().put("maxWakeScore", if (maxScore < 0f) Diagnostics.UNAVAILABLE else maxScore.toDouble())
+                .put("speechChunks", speech).put("threshold", cfg.threshold.toDouble()),
             recordingId = id
         )
         saveClip("MISSED_MARK", null, samples, now - samples.size * 1000L / SR, now, null, maxScore, meta, id, label = "MISSED_WAKE")
@@ -229,7 +236,10 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
         LiveStatus.state = "STARTING"
         cfg.load()
-        loadEngines()
+        LiveStatus.wakeEngineStatus = "loading…"
+        LiveStatus.vadEngineStatus = "loading…"
+        store.log("ENGINES_LOADING", "Loading ONNX models in background; microphone capture starts immediately")
+        Thread({ loadEngines() }, "jarvis-engine-load").also { it.priority = Thread.NORM_PRIORITY }.start()
         var backoff = 1000L
         while (running) {
             if (paused) {
@@ -269,8 +279,10 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
         raw?.let { finishCapture(it, "SERVICE_STOPPED") }
         if (cand.active) endCandidate(now)
         drainActions()
-        runCatching { wake?.close() }; runCatching { vad?.close() }
-        wake = null; vad = null
+        synchronized(engineLock) {
+            runCatching { wake?.close() }; runCatching { vad?.close() }
+            wake = null; vad = null
+        }
         LiveStatus.state = "STOPPED"
         LiveStatus.micOpen = false
     }
@@ -281,6 +293,8 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
             try { a() } catch (t: Throwable) { store.log("PIPELINE_ACTION_ERROR", t.toString()) }
         }
     }
+
+    private val engineLock = Any()
 
     private fun loadEngines() {
         val t0 = SystemClock.elapsedRealtime()
@@ -294,8 +308,18 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
             return
         }
         try {
+            val t1 = SystemClock.elapsedRealtime()
+            val v = SileroVad(env!!, asset("silero_vad.onnx"))
+            synchronized(engineLock) { if (running) vad = v else { v.close(); return } }
+            LiveStatus.vadEngineStatus = "OK (Silero VAD v4, init ${SystemClock.elapsedRealtime() - t1} ms)"
+            store.log("VAD_ENGINE_INIT", "OK", JSONObject().put("engine", "Silero VAD v4").put("threshold", cfg.vadThr.toDouble()))
+        } catch (t: Throwable) {
+            LiveStatus.vadEngineStatus = "FAILED (energy fallback > -40 dBFS): $t"
+            store.log("VAD_ENGINE_INIT_FAILED", t.toString())
+        }
+        try {
             val e = WakeWordEngine(env!!, asset("melspectrogram.onnx"), asset("embedding_model.onnx"), asset("hey_jarvis_v0.1.onnx"))
-            wake = e
+            synchronized(engineLock) { if (running) wake = e else { e.close(); return } }
             val ms = SystemClock.elapsedRealtime() - t0
             LiveStatus.wakeEngineStatus = "OK (openWakeWord hey_jarvis_v0.1, ORT ${BuildConfig.ORT_VERSION}, init ${ms} ms)"
             store.log(
@@ -308,15 +332,6 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
         } catch (t: Throwable) {
             LiveStatus.wakeEngineStatus = "FAILED: $t"
             store.log("WAKE_ENGINE_INIT_FAILED", t.toString(), JSONObject().put("stack", t.stackTraceToString().take(4000)))
-        }
-        try {
-            val t1 = SystemClock.elapsedRealtime()
-            vad = SileroVad(env!!, asset("silero_vad.onnx"))
-            LiveStatus.vadEngineStatus = "OK (Silero VAD v4, init ${SystemClock.elapsedRealtime() - t1} ms)"
-            store.log("VAD_ENGINE_INIT", "OK", JSONObject().put("engine", "Silero VAD v4").put("threshold", cfg.vadThr.toDouble()))
-        } catch (t: Throwable) {
-            LiveStatus.vadEngineStatus = "FAILED (energy fallback > -40 dBFS): $t"
-            store.log("VAD_ENGINE_INIT_FAILED", t.toString())
         }
     }
 
@@ -462,8 +477,18 @@ class AudioPipeline(private val app: JarvisApp, private val listener: Listener) 
         clockSamples += CHUNK
         val drift = now - (clockBaseWall + clockSamples * 1000 / SR)
         if (drift > 1000) {
-            store.log("AUDIO_GAP", "Wall clock ran ${drift} ms ahead of delivered audio (capture stalled / process frozen?)",
-                JSONObject().put("gapMs", drift).put("screen", runCatching { Diagnostics.power(app) }.getOrNull()))
+            gapCount++
+            gapTotalMs += drift
+            val overrun = LiveStatus.procAvgMs > CHUNK_MS * 0.8
+            if (now - lastGapLogTs >= 30_000) {
+                val cause = if (overrun) "PROCESSING_OVERRUN: processing (avg %.0f ms/80 ms chunk) is slower than real time, audio was dropped".format(LiveStatus.procAvgMs)
+                    else "CAPTURE_STALLED: audio stopped arriving (process frozen / CPU suspended / audio HAL stalled?)"
+                store.log("AUDIO_GAP", "$gapCount gap(s), ${gapTotalMs} ms of audio missing since last report – $cause",
+                    JSONObject().put("lastGapMs", drift).put("gapsSinceLastReport", gapCount).put("missingMsSinceLastReport", gapTotalMs)
+                        .put("likelyCause", if (overrun) "PROCESSING_OVERRUN" else "CAPTURE_STALLED")
+                        .put("procAvgMs", LiveStatus.procAvgMs).put("power", runCatching { Diagnostics.power(app) }.getOrNull()))
+                lastGapLogTs = now; gapCount = 0; gapTotalMs = 0
+            }
             clockBaseWall = now; clockSamples = 0
         } else if (drift < -3000) {
             clockBaseWall = now; clockSamples = 0
