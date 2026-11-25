@@ -413,9 +413,10 @@ class MainActivity : Activity() {
             else if (s.samples > 0) "No live level. Loudest this session: %.0f dBFS".format(s.maxPeakDb) else "No audio received yet"
         micLevelText?.setTextColor(if (live && s.recordingNow) Color.rgb(255, 110, 110) else Color.LTGRAY)
         val elapsed = if (s.startTs > 0) (if (s.running) now else s.lastSampleTs.coerceAtLeast(s.startTs)) - s.startTs else 0
-        micInfoText?.text = "Listening %d:%02d · %d saved this session · mic silenced by Android: %s".format(
-            elapsed / 60000, (elapsed / 1000) % 60, s.files,
-            LiveStatus.micSilencedByOs?.let { if (it) "YES" else "no" } ?: "unknown")
+        micInfoText?.text = if (s.startTs == 0L) "No listening session yet"
+            else "%s %d:%02d · %d saved · mic silenced by Android: %s".format(
+                if (s.running) "Listening" else "Last session", elapsed / 60000, (elapsed / 1000) % 60, s.files,
+                LiveStatus.micSilencedByOs?.let { if (it) "YES" else "no" } ?: "unknown")
         if (tick++ % 30 == 0) { refreshHistory(); updateTexts() }
     }
 
