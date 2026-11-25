@@ -1,0 +1,84 @@
+name: Build APK
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build signed release APK
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          GIT_SHA: ${{ github.sha }}
+        run: ./gradlew --no-daemon --stacktrace :core:test :app:assembleRelease
+
+      - name: Prepare APK
+        id: apk
+        run: |
+          VERSION="0.1.${{ github.run_number }}"
+          SHORT="${GITHUB_SHA::7}"
+          NAME="jarvis-proto001-v${VERSION}-${SHORT}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$NAME"
+          cp app/build/outputs/apk/release/app-release.apk jarvis-proto001-latest.apk
+          sha256sum "$NAME" jarvis-proto001-latest.apk > SHA256SUMS.txt
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner
+          "$APKSIGNER" verify --print-certs "$NAME" | tee signing.txt
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Jarvis Prototype 001 – build ${{ github.run_number }}"
+            echo "- APK: \`$NAME\` ($(du -h "$NAME" | cut -f1))"
+            echo "- Commit: \`$GITHUB_SHA\` on \`$GITHUB_REF_NAME\`"
+            echo '```'; cat signing.txt; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-proto001-v${{ steps.apk.outputs.version }}-${{ steps.apk.outputs.short }}
+          path: |
+            ${{ steps.apk.outputs.name }}
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Jarvis Prototype 001 – build ${{ github.run_number }} (v${{ steps.apk.outputs.version }})
+          target_commitish: ${{ github.sha }}
+          make_latest: 'true'
+          body: |
+            Development build of Jarvis Prototype 001 (wake-word feasibility experiment).
+
+            * Version: v${{ steps.apk.outputs.version }} (versionCode ${{ github.run_number }})
+            * Commit: ${{ github.sha }} (branch `${{ github.ref_name }}`)
+            * Signed with the repository's development key, so it installs over earlier builds and keeps your diagnostic data.
+
+            Install on the phone: download `jarvis-proto001-latest.apk` (or the versioned file), open it, allow "Install unknown apps" for your browser if asked.
+            Permanent link to the newest build: https://github.com/${{ github.repository }}/releases/latest/download/jarvis-proto001-latest.apk
+          files: |
+            ${{ steps.apk.outputs.name }}
+            jarvis-proto001-latest.apk
+            SHA256SUMS.txt
