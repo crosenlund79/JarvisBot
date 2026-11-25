@@ -156,7 +156,12 @@ object Transcription {
         var busy = true
         while (true) {
             try {
-                val job = jobs.poll(if (busy) 0L else 30L, TimeUnit.SECONDS)
+                // Busy: look for more work at once. Idle: wake only for new work, or to release the model / sync a file.
+                val job = when {
+                    busy -> jobs.poll()
+                    engine != null || dirtyDays.isNotEmpty() -> jobs.poll(30L, TimeUnit.SECONDS)
+                    else -> jobs.take()
+                }
                 if (job != null && job !== KICK) { job.run(); busy = true; continue }
                 if (mode() == "AUTO" && engineProblem == null) {
                     val r = app.store.nextUntranscribed()
