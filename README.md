@@ -54,14 +54,15 @@ Choose *Voice-enhanced* or *Both* before exporting. Each enhanced copy is comput
 
 Files have matching names (`…_raw.wav`, `…_enhanced.wav`, `…_diagnostics.json`), and the JSON records the method and its measurements. If enhancement fails, the original is exported instead and the failure is reported. Original recordings are never modified.
 
-## First start
+## First start (wake word)
 
 1. Open **Jarvis Proto 001** and grant **Microphone** and **Notifications**.
-2. *(Recommended)* Under Control → *Request: ignore battery optimizations*, choose Allow.
-3. Tick **Diagnostic Mode**, pick the recognition language (da-DK / en-US / en-GB), then tap **ENABLE Jarvis**.
-4. A persistent notification "Listening for "Hey Jarvis"" appears. You can now leave the app, lock the phone, or turn the screen off.
-5. Say "Hey Jarvis" → beep → say the command → pause. Or say it in one go: "Hey Jarvis, remind me to buy milk tomorrow."
-6. The result appears in the **Commands** tab, and every step is in **Events**.
+2. Pick the recognition language (da-DK / en-US / en-GB) at the bottom of the main screen, then tap **Wake word & recognition**.
+3. *(Recommended)* Tap **Allow background use** and choose Allow.
+4. Tick **Diagnostic Mode**, then tap **ENABLE wake word**.
+5. A persistent notification "Listening for "Hey Jarvis"" appears. You can now leave the app, lock the phone, or turn the screen off.
+6. Say "Hey Jarvis" → beep → say the command → pause. Or say it in one go: "Hey Jarvis, remind me to buy milk tomorrow."
+7. The result appears in the **Commands** tab, and every step is in **Events**.
 
 The notification has two buttons:
 * **Missed it!** saves the last 15 s of audio, with wake-word scores, as a `MISSED_MARK` recording.
