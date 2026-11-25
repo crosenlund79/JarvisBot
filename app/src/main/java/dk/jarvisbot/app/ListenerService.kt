@@ -205,6 +205,7 @@ class ListenerService : Service(), AudioPipeline.Listener {
     }
 
     private fun stopEverything() {
+        if (cleanStop && pipeline == null) return
         cleanStop = true
         main.removeCallbacks(heartbeat)
         pipeline?.stop()
