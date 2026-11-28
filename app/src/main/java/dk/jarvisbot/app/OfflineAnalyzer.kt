@@ -14,9 +14,7 @@ import org.json.JSONObject
  */
 object OfflineAnalyzer {
     fun analyze(app: JarvisApp, rec: DiagStore.RecordingRow): String {
-        val f = app.store.fileFor(rec)
-        if (!f.exists()) return "File missing: ${rec.file}"
-        val (pcm, sr) = Wav.read(f)
+        val (pcm, sr) = runCatching { DiagnosticFolder.readRecording(rec) }.getOrElse { return "Audio not available: ${it.message}" }
         if (sr != 16000) return "Unsupported sample rate $sr (expected 16000)"
         val t0 = System.currentTimeMillis()
         fun asset(n: String) = app.assets.open("models/$n").use { it.readBytes() }

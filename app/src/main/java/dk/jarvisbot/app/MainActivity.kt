@@ -47,7 +47,7 @@ import java.util.Locale
 
 /**
  * Deliberately plain UI.
- * Main screen: listening, sensitivity, image, sync folder, export, storage, recordings.
+ * Main screen: listening, sensitivity, image, diagnostic folder, transcription, export, storage, recordings.
  * "Wake word & recognition" screen: the original wake-word prototype controls (Control / Commands / Events).
  * Technical parameters are no longer shown; they keep their internal defaults (and any earlier saved values).
  */
@@ -116,7 +116,7 @@ class MainActivity : Activity() {
         store.log("UI_RESUMED", "", JSONObject().put("serviceRunning", LiveStatus.serviceRunning).put("micTestRunning", MicStatus.running))
         checkMicTestInterrupted()
         autostartWakeWordIfEnabled()
-        SyncFolder.refreshUsageAsync()
+        StorageManager.requestCheck(delayMs = 500)
     }
 
     override fun onPause() {
@@ -236,13 +236,13 @@ class MainActivity : Activity() {
         l.addView(imageText)
         l.addView(row(btn("Choose Image") { chooseImage() }, btn("Show Image") { startActivity(Intent(this, ImageActivity::class.java)) }))
 
-        // Sync folder
-        l.addView(header("Sync folder (picked up by OneSync → OneDrive)"))
+        // Diagnostic folder
+        l.addView(header("Diagnostic folder"))
         syncText = tv("", 13f)
         l.addView(syncText)
-        l.addView(row(btn("Choose folder…") { chooseSyncFolder() }, btn("Stop copying") {
-            if (!SyncFolder.isConfigured()) toast("No sync folder is set")
-            else confirm("Stop copying new recordings to ${SyncFolder.label()}? Files already there are kept.") { SyncFolder.disable(this); updateTexts() }
+        l.addView(row(btn("Choose folder…") { chooseSyncFolder() }, btn("Stop writing") {
+            if (!DiagnosticFolder.isConfigured()) toast("No diagnostic folder is set")
+            else confirm("Stop writing to ${DiagnosticFolder.label()}? Files already there are kept.") { DiagnosticFolder.disable(this); updateTexts() }
         }))
 
         // Transcription
@@ -279,6 +279,15 @@ class MainActivity : Activity() {
 
         // Storage
         l.addView(header("Storage"))
+        l.addView(row(tv("Storage limit for Jarvis data:", 14f), spinner(StorageManager.LIMITS_MB.map { StorageManager.label(it) },
+            StorageManager.label(prefs.storageLimitTotalMb)) { sel ->
+            val mbv = StorageManager.LIMITS_MB.first { StorageManager.label(it) == sel }
+            if (mbv != prefs.storageLimitTotalMb) {
+                prefs.storageLimitTotalMb = mbv
+                store.log("STORAGE_LIMIT_CHANGED", sel)
+                StorageManager.requestCheck(delayMs = 500)
+            }
+        }))
         storageText = tv("", 13f)
         l.addView(storageText)
         l.addView(btn("Clean up…") { cleanupDialog() })
@@ -309,17 +318,18 @@ class MainActivity : Activity() {
         imageText?.text = if (File(File(filesDir, IMAGE_DIR), IMAGE_FILE).exists())
             "Selected: ${prefs.displayImageName.ifEmpty { "image" }}" else "No image chosen yet (a placeholder is shown)"
         syncText?.text = when {
-            !SyncFolder.isConfigured() -> "Not set. Recordings stay inside the app. Suggested: Documents/Jarvis/Dumps"
-            SyncFolder.ok == false -> "⚠ ${SyncFolder.label()} – not reachable (${SyncFolder.problem}). Recordings stay on the phone and are copied when the folder works again. Choose the folder again if this persists."
-            else -> "✓ ${SyncFolder.label()}\nNew recordings are copied there automatically (raw WAV + diagnostics JSON)." +
-                (if (SyncFolder.lastCopyTs > 0) "\nLast copy: ${fmtTs(SyncFolder.lastCopyTs)}" else "") +
-                (if (SyncFolder.folderFiles >= 0) "\nIn folder: ${SyncFolder.folderFiles} Jarvis files, ${mb(SyncFolder.folderBytes)} (max ${mb(SyncFolder.CAP_BYTES)})" else "")
+            !DiagnosticFolder.isConfigured() -> "Not set. Recordings stay inside the app, which Windows cannot see over USB. Suggested: Documents/Jarvis/Dumps"
+            DiagnosticFolder.ok == false -> "⚠ ${DiagnosticFolder.label()} – not reachable (${DiagnosticFolder.problem}). Recordings stay on the phone and are copied when the folder works again. Choose the folder again if this persists."
+            else -> "✓ ${DiagnosticFolder.label()}\nOriginal recordings, per-recording diagnostics, daily transcriptions, session logs and daily logs are written here, " +
+                "in one folder per day and one per hour (e.g. ${DailyReports.dayOf(System.currentTimeMillis())}/08/).\n" +
+                "USB: on the PC open This PC › phone › Internal shared storage › ${DiagnosticFolder.label().replace("/", " › ")} and copy the folders." +
+                (if (DiagnosticFolder.lastCopyTs > 0) "\nLast copy: ${fmtTs(DiagnosticFolder.lastCopyTs)}" else "") +
+                (DiagnosticFolder.busyWith?.let { "\nNow: $it" } ?: "") +
+                (prefs.diagFolderReport.takeIf { it.isNotEmpty() }?.let { "\nFolder update: $it" } ?: "")
         }
         transcriptText?.text = runCatching { Transcription.statusText() }.getOrElse { "Status unavailable: $it" } +
-            "\nDaily files: one per day (e.g. ${Transcription.fileName(Transcription.dayOf(System.currentTimeMillis()))}), copied to the sync folder and included in exports."
-        val stat = StatFs(filesDir.path)
-        storageText?.text = "On this phone: ${mb(store.audioBytes())} audio (limit ${mb(prefs.storageLimitMb * 1048576L)}, oldest deleted automatically), " +
-            "${mb(store.dbFileBytes())} logs. Free: %.1f GB".format(stat.availableBytes / 1e9)
+            "\nDaily files: one per day (e.g. ${Transcription.fileName(Transcription.dayOf(System.currentTimeMillis()))}), written to the diagnostic folder and included in exports."
+        storageText?.text = StorageManager.summaryText()
     }
 
     private fun refreshHistory(force: Boolean = false) {
@@ -343,7 +353,12 @@ class MainActivity : Activity() {
                 r.category == "INTERRUPTED" -> "interrupted$peakTxt"
                 else -> "sound$peakTxt"
             }
-            val synced = if (SyncFolder.isConfigured() && store.syncedName(r.id) != null) " · copied" else ""
+            val inFolder = store.syncedName(r.id) != null
+            val synced = when {
+                !store.fileFor(r).exists() && inFolder -> " · in folder only"
+                DiagnosticFolder.isConfigured() && inFolder -> " · in folder"
+                else -> ""
+            }
             val t = tv("${if (r.id == playingId) "▶ " else ""}${fmtTs(r.tsStart)} · %.0f s · %s%s%s".format(
                 r.durationMs / 1000.0, what, r.label?.let { " [$it]" } ?: "", synced), 14f).apply {
                 setPadding(dp(4), dp(10), dp(4), dp(10))
@@ -357,7 +372,7 @@ class MainActivity : Activity() {
 
     private fun cleanupDialog() {
         val opts = arrayOf("Delete recordings older than 7 days", "Delete ALL recordings and logs on this phone")
-        AlertDialog.Builder(this).setTitle("Clean up (files in the sync folder are not touched)").setItems(opts) { _, w ->
+        AlertDialog.Builder(this).setTitle("Clean up the phone (files in the diagnostic folder are not touched)").setItems(opts) { _, w ->
             when (w) {
                 0 -> confirm("Delete recordings older than 7 days from the phone?") {
                     val (n, b) = store.deleteRecordingsBefore(System.currentTimeMillis() - 7 * 86_400_000L)
@@ -490,12 +505,13 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // ------------------------------------------------------------------ sync folder
+    // ------------------------------------------------------------------ diagnostic folder
 
     private fun chooseSyncFolder() {
-        AlertDialog.Builder(this).setTitle("Choose the sync folder")
+        AlertDialog.Builder(this).setTitle("Choose the diagnostic folder")
             .setMessage("In the next screen open \"Documents\", create the folder \"Jarvis\" and inside it \"Dumps\" (⋮ or folder icon → New folder), " +
-                "open Dumps and tap \"Use this folder\" → Allow.\n\nThen point OneSync (Autosync for OneDrive) at that same folder.")
+                "open Dumps and tap \"Use this folder\" → Allow.\n\nJarvis then writes its recordings and diagnostics there, one folder per day and hour, " +
+                "and you can copy them to a PC over USB. A sync app (e.g. OneSync) can also use this folder, including its subfolders.")
             .setPositiveButton("Continue") { _, _ ->
                 val i = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(
                     Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
@@ -513,6 +529,7 @@ class MainActivity : Activity() {
         if (exporting) { toast("An export is already running"); return }
         val i = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("application/zip")
             .putExtra(Intent.EXTRA_TITLE, Exporter.fileName())
+        DiagnosticFolder.rootUri()?.let { runCatching { i.putExtra(DocumentsContract.EXTRA_INITIAL_URI, it) } } // start in the diagnostic folder
         startActivityForResult(i, REQ_EXPORT)
     }
 
@@ -554,9 +571,9 @@ class MainActivity : Activity() {
         val uri = data?.data ?: return
         when (requestCode) {
             REQ_EXPORT -> runExport({ contentResolver.openOutputStream(uri)!! }) { toast("$it → saved") }
-            REQ_FOLDER -> runCatching { SyncFolder.configure(this, uri) }
-                .onSuccess { toast("Sync folder: ${SyncFolder.label()}"); updateTexts() }
-                .onFailure { toast("Could not use this folder: $it"); store.log("SYNC_FOLDER_SELECT_FAILED", it.toString()) }
+            REQ_FOLDER -> runCatching { DiagnosticFolder.configure(this, uri) }
+                .onSuccess { toast("Diagnostic folder: ${DiagnosticFolder.label()}"); updateTexts() }
+                .onFailure { toast("Could not use this folder: $it"); store.log("DIAG_FOLDER_SELECT_FAILED", it.toString()) }
             REQ_IMAGE -> onImageChosen(uri)
         }
     }
@@ -566,10 +583,12 @@ class MainActivity : Activity() {
     private fun play(r: DiagStore.RecordingRow) {
         stopPlayback()
         val f = store.fileFor(r)
-        if (!f.exists()) { toast("File missing: ${r.file}"); return }
+        // the phone copy, or else the copy in the diagnostic folder (phone copies may have been removed to save space)
+        val folderUri = if (f.exists()) null else DiagnosticFolder.folderAudio(r)
+        if (!f.exists() && folderUri == null) { toast("Audio not available: it is neither on the phone nor in the diagnostic folder"); return }
         try {
             player = MediaPlayer().apply {
-                setDataSource(f.path)
+                if (folderUri != null) setDataSource(this@MainActivity, folderUri) else setDataSource(f.path)
                 setOnCompletionListener { stopPlayback(); refreshHistory(true) }
                 prepare(); start()
             }
@@ -616,7 +635,7 @@ class MainActivity : Activity() {
                 8 -> { store.setRecordingLabel(r.id, null, null); store.log("USER_LABEL", "cleared", recordingId = r.id); refresh() }
                 9 -> editText("Note", r.note ?: "") { store.setRecordingLabel(r.id, r.label, it); refresh() }
                 10 -> info(r.id, r.toJson().toString(2))
-                11 -> confirm("Delete this recording from the phone? (A copy in the sync folder is not touched.)") {
+                11 -> confirm("Delete this recording from the phone? (A copy in the diagnostic folder is not touched.)") {
                     if (playingId == r.id) stopPlayback()
                     store.deleteRecording(r.id); store.log("USER_DELETED_RECORDING", r.file, recordingId = r.id); refresh()
                 }
@@ -860,7 +879,7 @@ class MainActivity : Activity() {
         val l = vbox()
         val filters = linkedMapOf(
             "All" to null, "Errors / warnings" to listOf("%"), "Microphone test" to listOf("MICTEST"),
-            "Sync folder" to listOf("SYNC_"), "Wake word" to listOf("WAKE_", "USER_MARKED", "ACK_BEEP", "SPEECH_REGION"),
+            "Diagnostic folder / storage" to listOf("SYNC_", "DIAG_FOLDER", "STORAGE"), "Wake word" to listOf("WAKE_", "USER_MARKED", "ACK_BEEP", "SPEECH_REGION"),
             "Commands / recognition" to listOf("COMMAND_", "RECOGNITION"), "Mic / audio" to listOf("MIC_", "AUDIO_", "RECORDING_CLIENTS"),
             "Heartbeat" to listOf("HEARTBEAT"),
             "Service / process" to listOf("SERVICE", "FGS", "PROCESS", "SUSPECTED", "CRASH", "JARVIS_", "WAKELOCK", "TASK_", "MEMORY"),

@@ -290,6 +290,7 @@ class ListenerService : Service(), AudioPipeline.Listener {
 
     override fun onDestroy() {
         main.removeCallbacks(heartbeat)
+        DiagnosticFolder.listeningStopped() // refresh today's daily diagnostics in the diagnostic folder
         if (pipeline != null || micTest != null) {
             app.store.log("SERVICE_DESTROYED_UNEXPECTEDLY", "onDestroy while audio capture was running (system stop?)", sync = true)
             pipeline?.stop()

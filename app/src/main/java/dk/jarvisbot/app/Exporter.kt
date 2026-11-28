@@ -47,17 +47,19 @@ object Exporter {
             text("device.json", Diagnostics.deviceJson(ctx).toString(2))
             text("settings.json", app.prefs.toJson().toString(2))
             text("exit_reasons.json", Diagnostics.exitReasonsJson(ctx).toString(2))
-            text("storage.json", JSONObject().put("audioBytes", store.audioBytes()).put("dbBytes", store.dbFileBytes())
+            text("storage.json", StorageManager.usageJson()
                 .put("byKind", JSONObject().also { o -> store.countsByKind().forEach { (k, v) -> o.put(k, JSONObject().put("count", v.first).put("bytes", v.second)) } })
-                .put("storageLimitMb", app.prefs.storageLimitMb).toString(2))
+                .put("storageLimitMb", app.prefs.storageLimitTotalMb).toString(2))
 
-            // recordings (export names: <yyyy-MM-dd_HH-mm-ss-SSS>[_kind]_raw.wav / _enhanced.wav / _diagnostics.json)
+            // recordings, organised like the diagnostic folder: <yyyy-MM-dd>/<HH>/<yyyy-MM-dd_HH-mm-ss-SSS>[_kind]_raw.wav etc.
             val recs = store.recordings(null, Int.MAX_VALUE).filter { it.category != "RECORDING" }
             val used = HashSet<String>()
             val baseOf = HashMap<String, String>()
+            val delivered = store.deliveredBases().entries.associate { it.value to it.key }
             for (r in recs.sortedBy { it.tsStart }) {
-                var b = SyncFolder.baseName(r); var k = 2
-                while (!used.add(b)) b = SyncFolder.baseName(r) + "-" + k++
+                val first = delivered[r.id]?.takeIf { it.length >= 23 } ?: DiagnosticFolder.baseName(r) // same name as in the folder
+                var b = first; var k = 2
+                while (!used.add(b)) b = first.substring(0, 23) + "-" + k++ + first.substring(23)
                 baseOf[r.id] = b
             }
             text("recordings.json", JSONArray().also { a -> recs.forEach { a.put(it.toJson().put("export_base", baseOf[it.id])) } }.toString(1))
@@ -86,8 +88,8 @@ object Exporter {
                     "command_text", "corrected_text", "recognition_label"),
                 cmdRecs.flatMap { c ->
                     val rs = rcgs.filter { it.recordingId == c.id }
-                    if (rs.isEmpty()) listOf(listOf(c.interactionId, c.id, DiagStore.iso(c.tsStart), "audio/${c.file}", c.durationMs, c.category, c.maxScore, c.label))
-                    else rs.map { r -> listOf(c.interactionId, c.id, DiagStore.iso(c.tsStart), "audio/${c.file}", c.durationMs, c.category, c.maxScore, c.label,
+                    if (rs.isEmpty()) listOf(listOf(c.interactionId, c.id, DiagStore.iso(c.tsStart), baseOf[c.id]?.let { b -> DiagnosticFolder.recordingPath(b) + "/" + b + "_raw.wav" }, c.durationMs, c.category, c.maxScore, c.label))
+                    else rs.map { r -> listOf(c.interactionId, c.id, DiagStore.iso(c.tsStart), baseOf[c.id]?.let { b -> DiagnosticFolder.recordingPath(b) + "/" + b + "_raw.wav" }, c.durationMs, c.category, c.maxScore, c.label,
                         r.id, r.language, r.engine, r.status, r.latencyMs, r.audioBinding, r.text, r.commandText, r.correctedText, r.label) }
                 }
             ))
@@ -134,19 +136,22 @@ object Exporter {
                 for (r in recs) {
                     i++
                     val f = store.fileFor(r)
-                    if (!f.exists()) continue
+                    // the phone copy, or else the copy in the diagnostic folder (phone copies may have been removed to save space)
+                    val folderBytes = if (f.exists()) null else runCatching { DiagnosticFolder.recordingBytes(r) }.getOrNull()
+                    if (!f.exists() && folderBytes == null) continue
                     val base = baseOf[r.id]!!
+                    val dir = DiagnosticFolder.recordingPath(base)
                     progress("Exporting $i / ${recs.size}" + if (withEnh) " (voice enhancement)" else "")
                     var rawName: String? = null
                     var enhName: String? = null
                     var enhInfo: JSONObject? = null
                     if (withEnh) {
                         try {
-                            val (pcm, sr) = Wav.read(f)
+                            val (pcm, sr) = if (folderBytes != null) Wav.read(folderBytes) else Wav.read(f)
                             val res = SpeechEnhancer.enhance(pcm, sr)
                             val bytes = wavBytes(res.samples, sr)
                             enhName = "${base}_enhanced.wav"
-                            stored(zip, "audio/$enhName", bytes)
+                            stored(zip, "$dir/$enhName", bytes)
                             enhInfo = JSONObject(res.info as Map<*, *>).put("status", "OK")
                             enhancedOk++
                             progress("Exporting $i / ${recs.size} (transcribing the voice-enhanced audio)")
@@ -160,19 +165,26 @@ object Exporter {
                     }
                     if (withRaw || enhName == null) {
                         rawName = "${base}_raw.wav"
-                        zip.putNextEntry(ZipEntry("audio/$rawName").apply { method = ZipEntry.STORED; size = f.length(); compressedSize = f.length(); crc = crc32(f) })
-                        f.inputStream().use { it.copyTo(zip) }
-                        zip.closeEntry()
+                        if (folderBytes != null) stored(zip, "$dir/$rawName", folderBytes) else {
+                            zip.putNextEntry(ZipEntry("$dir/$rawName").apply { method = ZipEntry.STORED; size = f.length(); compressedSize = f.length(); crc = crc32(f) })
+                            f.inputStream().use { it.copyTo(zip) }
+                            zip.closeEntry()
+                        }
                     }
-                    text("audio/${base}_diagnostics.json", SyncFolder.diagnosticsJson(r, rawName, enhName, enhInfo).toString(2))
+                    text("$dir/${base}_diagnostics.json", DiagnosticFolder.diagnosticsJson(r, rawName, enhName, enhInfo).toString(2))
                     audioFiles++
                 }
             }
 
-            // daily transcription files + one table of all transcriptions
-            progress("Writing transcriptions…")
-            for ((name, content) in Transcription.dailyFilesForExport()) { text("transcripts/$name", content); transcriptDays++ }
-            text("transcripts/transcripts.csv", csv(
+            // per day, as in the diagnostic folder: transcription + daily diagnostics, events and recognitions
+            progress("Writing daily transcriptions and diagnostics…")
+            for ((name, content) in Transcription.dailyFilesForExport()) { text(name.substring(0, 10) + "/" + name, content); transcriptDays++ }
+            for (day in store.daysWithData()) {
+                text("$day/${DailyReports.DIAGNOSTICS}", DailyReports.diagnosticsJson(ctx, day).toString(2))
+                zip.putNextEntry(ZipEntry("$day/${DailyReports.EVENTS}")); DailyReports.writeEvents(day, zip); zip.closeEntry()
+                zip.putNextEntry(ZipEntry("$day/${DailyReports.RECOGNITIONS}")); DailyReports.writeRecognitions(day, zip); zip.closeEntry()
+            }
+            text("transcripts.csv", csv(
                 listOf("recording_id", "variant", "day", "start_iso", "end_iso", "audio_file", "kind", "category", "duration_ms", "status", "language", "text", "details"),
                 store.allTranscripts().map { listOf(it.recordingId, it.variant, it.day, DiagStore.iso(it.tsStart), DiagStore.iso(it.tsEnd), it.audioName,
                     it.kind, it.category, it.durationMs, it.status, it.language, it.text, it.info) }
@@ -224,10 +236,15 @@ object Exporter {
         Created: ${DiagStore.iso(System.currentTimeMillis())}
         App: ${BuildConfig.VERSION_NAME} (code ${BuildConfig.VERSION_CODE}, git ${BuildConfig.GIT_SHA}, built ${BuildConfig.BUILD_TIME})
 
-        AUDIO FILES: audio/<start time>[_kind]_raw.wav = ORIGINAL recording, never modified;
-        audio/<same name>_enhanced.wav = voice-enhanced copy (only if requested at export; method "${SpeechEnhancer.METHOD}":
-        ${SpeechEnhancer.DESCRIPTION}); audio/<same name>_diagnostics.json = levels, threshold, sensitivity, events,
-        recognitions and which enhancement was applied (or why it failed).
+        LAYOUT (same as the diagnostic folder on the phone):
+          <yyyy-MM-dd>/<HH>/<start time>[_kind]_raw.wav        ORIGINAL recording, never modified
+          <yyyy-MM-dd>/<HH>/<start time>[_kind]_enhanced.wav   voice-enhanced copy (only if requested at export; method
+                                                              "${SpeechEnhancer.METHOD}": ${SpeechEnhancer.DESCRIPTION})
+          <yyyy-MM-dd>/<HH>/<start time>[_kind]_diagnostics.json  levels, threshold, sensitivity, events, recognitions,
+                                                              transcription and which enhancement was applied (or why it failed)
+          <yyyy-MM-dd>/<yyyy-MM-dd>_Transcription.txt         daily transcription
+          <yyyy-MM-dd>/Daily_Diagnostics.json, Daily_Events.csv, Daily_Recognitions.csv
+        Day and hour are those of the original recording time (phone's local time).
 
         MICROPHONE TEST (kind MICTEST, standard MIC source, normally 44.1 kHz, unmodified samples). Recordings are saved when a
         100 ms block's peak reaches the sensitivity threshold (meta: sensitivity, thresholdDb, triggerPeakDb, peakDb, rmsDb),
@@ -239,15 +256,15 @@ object Exporter {
         % of expected samples, level, all-zero?), MICTEST_NO_AUDIO, MICTEST_ONLY_ZEROS, MICTEST_READ_ERROR, MICTEST_MIC_RESTART,
         MICTEST_INTERRUPTED, plus service/heartbeat/screen events.
 
-        TRANSCRIPTIONS: transcripts/<yyyy-MM-dd>_Transcription.txt = one readable UTF-8 file per day (by recording date),
+        TRANSCRIPTIONS: <yyyy-MM-dd>/<yyyy-MM-dd>_Transcription.txt = one readable UTF-8 file per day (by recording date),
         chronological, with start/end time, audio file name, language, the recognised text exactly as produced, the
         voice-enhanced transcription if one was made, and uncertainty / errors. Recognizer: ${Transcription.ENGINE}.
-        transcripts/transcripts.csv = the same as a table, with all technical details (per-chunk language probabilities,
+        transcripts.csv = the same as a table, with all technical details (per-chunk language probabilities,
         no-speech probability, average log-probability, timings).
 
         All timestamps: epoch milliseconds (ts) plus ISO-8601 local time (iso).
         interaction_id links one wake activation -> WAKE clip -> COMMAND recording -> recognition(s).
-        recording_id links events/recognitions to a WAV in audio/.
+        recording_id links events/recognitions to a recording (recordings.csv: export_base = file name without _raw.wav).
 
         Files
         - device.json            Android version, manufacturer/model, app version/build, engines + model SHA-256, recognizer services,
@@ -266,7 +283,7 @@ object Exporter {
         - recognition_errors.csv Recognition attempts that did not return a verified result.
         - events.jsonl/.csv      Complete technical event log. Subsets: wake_events, microphone_events, service_events,
                                  recognition_events, errors.
-        - audio/                 16 kHz mono 16-bit PCM WAV files.
+        - <yyyy-MM-dd>/<HH>/         recordings (16-bit mono PCM WAV: 44.1 kHz listening/mic test, 16 kHz wake-word clips).
 
         Useful event types
         LEVEL (periodic mic level/VAD/wake stats), HEARTBEAT, WAKE_CANDIDATE, WAKE_DETECTED, WAKE_SUPPRESSED, SPEECH_REGION,

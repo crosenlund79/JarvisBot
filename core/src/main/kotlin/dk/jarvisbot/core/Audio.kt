@@ -116,6 +116,13 @@ object Wav {
         RandomAccessFile(file, "r").use { raf ->
             val all = ByteArray(raf.length().toInt())
             raf.readFully(all)
+            return read(all)
+        }
+    }
+
+    /** Same as [read] for a whole WAV file already in memory. */
+    fun read(all: ByteArray): Pair<ShortArray, Int> {
+        run {
             val bb = ByteBuffer.wrap(all).order(ByteOrder.LITTLE_ENDIAN)
             require(String(all, 0, 4, Charsets.US_ASCII) == "RIFF") { "not a RIFF file" }
             var p = 12

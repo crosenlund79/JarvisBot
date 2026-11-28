@@ -21,27 +21,57 @@ One screen holds everything needed for everyday testing:
 * **Sensitivity slider**: sounds louder than the threshold are saved, including the 1 s before them. A recording ends after 2 s of quiet.
 * **Raw 30 s microphone test**: saves everything for 30 s, ignoring the threshold.
 * **Image**: *Choose Image* (gallery or files) and *Show Image* (full screen, aspect ratio kept). Listening continues while the image is shown.
-* **Sync folder** (for OneSync → OneDrive): every completed recording is copied there automatically.
+* **Diagnostic folder** (normally Documents/Jarvis/Dumps): recordings, diagnostics, transcriptions and daily logs, organised by day and hour, ready to copy over USB.
 * **Export**: a ZIP with *Raw*, *Voice-enhanced* or *Both*, plus all diagnostic logs.
-* **Storage** usage and *Clean up…*, the **recording list** (tap = play, long-press = recognize / analyze / label / delete), and the **speech recognition language**.
+* **Storage**: one limit for all Jarvis data (500 MB – 10 GB, default 2 GB), usage, *Clean up…*; the **recording list** (tap = play, long-press = recognize / analyze / label / delete), and the **speech recognition language**.
 
 **Wake word & recognition** opens the original wake-word prototype: enable/disable, wake threshold, Diagnostic Mode, recognizer tests, Commands and Events.
 
 Technical parameters (audio source, buffers, timings, thresholds …) are no longer shown. They use internal defaults, any earlier saved values are kept, and everything is recorded in the logs.
 
-### Sync folder → OneDrive
-1. Main screen → **Choose folder…** → in the picker open *Documents*, create *Jarvis* and then *Dumps*, open it, tap **Use this folder** → **Allow**.
-2. Each completed recording appears there as:
-   * `2026-11-25_11-42-03-517_raw.wav`, the original audio, never processed;
-   * `…_diagnostics.json`, with levels, threshold, sensitivity, events and recognitions.
-3. Each listening session also gets `…_session-log.csv` (refreshed every 30 min) and `…_session.json` (the summary when you press Stop).
-4. Files are written under a hidden `.partial` name and renamed when complete, so a sync app never sees half-written files.
+### Diagnostic folder (USB retrieval)
+1. Main screen → **Diagnostic folder** → **Choose folder…** → in the picker open *Documents*, create *Jarvis* and then *Dumps*, open it, tap **Use this folder** → **Allow**.
+2. Jarvis writes everything there, organised by the **original recording time** (phone's local time):
+   ```
+   Documents/Jarvis/Dumps/
+     2026-11-25/
+       08/
+         2026-11-25_08-12-03-517_raw.wav            original audio, never processed
+         2026-11-25_08-12-03-517_diagnostics.json   levels, threshold, events, recognitions, transcription
+       09/ …
+       2026-11-25_Transcription.txt                 all transcriptions of the day, in order
+       Daily_Diagnostics.json                       device/app info, recording settings, storage, sessions,
+                                                    interruptions, process exit reasons, counts, cleanups
+       Daily_Events.csv                             the complete event log of the day
+       Daily_Recognitions.csv                       every recognition attempt incl. errors
+       2026-11-25_08-00-01-123_session-log.csv      listening session log (+ _session.json at Stop)
+     2026-11-26/ …
+   ```
+   * Wake-word screen recordings carry their type in the name (`_wake`, `_command`, …).
+   * Daily files are refreshed every 30 min and when listening stops.
+   * A recording's diagnostics are rewritten once it has been transcribed.
+3. **USB**: connect the phone, choose *File transfer* in Android's USB notification, then on the PC open
+   *This PC › [phone] › Internal shared storage › Documents › Jarvis › Dumps* and copy the day folders.
+   You may delete copied folders from the phone; Jarvis does not copy a recording twice.
+4. Files are written under a hidden `.…partial` name and renamed when complete, so incomplete files never appear.
 5. If the folder is unreachable, recordings stay in the app and are copied later.
-6. Jarvis keeps at most 2 GB of its own files in the folder and deletes its oldest files first.
-7. In **OneSync (Autosync for OneDrive)**, create a folder pair from this phone folder to a OneDrive folder.
-   * **"Upload then delete"** is recommended: the phone copy is removed after uploading.
-   * "Upload only" also works.
-   * **Avoid two-way sync**: Jarvis' 2 GB cleanup would then delete files from OneDrive as well.
+6. When the folder is chosen, and once after updating from build 11 or older:
+   * The old flat layout is reorganised into day/hour folders. Files are moved, and a copy is verified by size and SHA-256 before an original is removed.
+   * Recordings still in the app that were never delivered are copied.
+7. Sync apps still work (e.g. OneSync, folder pair *including subfolders*). With "Upload then delete", Jarvis keeps its phone copies until it has verified the folder copy.
+
+### Storage limit
+One limit (500 MB, 1 GB, **2 GB default**, 5 GB, 10 GB) covers all Jarvis data:
+* recordings on the phone;
+* logs and transcriptions;
+* Jarvis's files in the diagnostic folder.
+
+Exported ZIPs in the folder are shown but not counted or deleted. Android always keeps at least 1 GB (or 5 % of the storage) free. When over the limit, or low on space:
+1. Phone copies of recordings already verified in the diagnostic folder are removed first (they are duplicates).
+2. Then the oldest recordings and session logs are deleted from the phone and the folder; labelled recordings go last.
+3. Daily transcription and diagnostics files are kept.
+
+Each cleanup is shown on the main screen and logged (`STORAGE_CLEANUP`). Recordings whose phone copy was removed still play, export and transcribe from the folder copy.
 
 ### Voice-enhanced export
 Choose *Voice-enhanced* or *Both* before exporting. Each enhanced copy is computed only during that export, by the built-in method `jarvis-speech-v1`, in pure Kotlin and fully offline:
@@ -52,7 +82,7 @@ Choose *Voice-enhanced* or *Both* before exporting. Each enhanced copy is comput
 5. Normalisation to about −20 dBFS.
 6. Soft limiter at −1 dBFS.
 
-Files have matching names (`…_raw.wav`, `…_enhanced.wav`, `…_diagnostics.json`), and the JSON records the method and its measurements. If enhancement fails, the original is exported instead and the failure is reported. Original recordings are never modified.
+Files have matching names (`…_raw.wav`, `…_enhanced.wav`, `…_diagnostics.json`) and the ZIP uses the same day/hour folders as the diagnostic folder (Save ZIP… starts in that folder). The JSON records the method and its measurements. If enhancement fails, the original is exported instead and the failure is reported. Original recordings are never modified.
 
 ### Daily transcription
 One setting on the main screen, under *Transcription*:
@@ -67,10 +97,10 @@ Recognition is fully offline: OpenAI's **Whisper small** (multilingual), int8 ON
 
 Results go into one UTF-8 file per day, named after the recording's own date: `2026-11-25_Transcription.txt`.
 * Entries are in recording order.
-* Each entry has the start/end time and the audio file name (as in the sync folder and ZIP), plus the language and the recognised text.
+* Each entry has the start/end time and the audio file name (as in the diagnostic folder and ZIP), plus the language and the recognised text.
 * An entry also shows the voice-enhanced transcription if one was made, and uncertainty notes: low confidence, possibly not speech, language unsure, repetitive output, errors.
 * Reprocessing replaces an entry; it never adds a second one.
-* The daily file is copied to the sync folder (complete before it appears, at most every 2 min while busy) and included in ZIP exports (`transcripts/`).
+* The daily file is written to the day's folder in the diagnostic folder (complete before it appears, at most every 2 min while busy) and included in ZIP exports.
 * An enhanced transcription is made when you export with *Voice-enhanced* or *Both*, because enhanced audio only exists during an export.
 * **View daily transcription…** shows a file on the phone.
 

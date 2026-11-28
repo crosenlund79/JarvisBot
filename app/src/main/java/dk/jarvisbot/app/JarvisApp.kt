@@ -25,6 +25,7 @@ class JarvisApp : Application() {
         )
         Diagnostics.startupChecks(this)
         runCatching { MicTest.recoverOrphans(this) }.onFailure { store.log("MICTEST_RECOVERY_ERROR", it.toString()) }
+        DiagnosticFolder.start()
         Transcription.start()
     }
 

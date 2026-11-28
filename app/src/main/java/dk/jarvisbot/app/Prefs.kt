@@ -56,12 +56,19 @@ class Prefs(ctx: Context) {
     var batteryAtEnable: Int get() = i("batteryAtEnable", -1); set(v) = sp.edit().putInt("batteryAtEnable", v).apply()
     /** Microphone test sensitivity 0..100 (higher = quieter sounds are saved). */
     var micSensitivity: Int get() = i("micSensitivity", MicTest.DEFAULT_SENSITIVITY); set(v) = sp.edit().putInt("micSensitivity", v.coerceIn(0, 100)).apply()
-    /** Sync folder (Storage Access Framework tree URI) that an external app such as OneSync uploads from. */
+    /** Diagnostic folder (Storage Access Framework tree URI), normally Documents/Jarvis/Dumps. */
     var syncTreeUri: String get() = s("syncTreeUri", ""); set(v) = sp.edit().putString("syncTreeUri", v).apply()
-    /** Only recordings saved after this time are copied to the sync folder (set when the folder is chosen). */
+    /** No longer used (all undelivered recordings are copied now); kept so older settings load unchanged. */
     var syncSinceTs: Long get() = l("syncSinceTs", 0); set(v) = sp.edit().putLong("syncSinceTs", v).apply()
     /** RAW, ENHANCED or BOTH – audio included in a manual diagnostic export. */
     var exportAudioMode: String get() = s("exportAudioMode", "RAW"); set(v) = sp.edit().putString("exportAudioMode", v).apply()
+    /** One limit for all Jarvis data (phone copies + diagnostic folder), in MB (10^6 bytes). */
+    var storageLimitTotalMb: Int get() = i("storageLimitTotalMb", 2000); set(v) = sp.edit().putInt("storageLimitTotalMb", v).apply()
+    /** Tree URI whose flat files have been reorganised into date/hour folders. */
+    var diagLayoutDoneFor: String get() = s("diagLayoutDoneFor", ""); set(v) = sp.edit().putString("diagLayoutDoneFor", v).apply()
+    var diagFolderReport: String get() = s("diagFolderReport", ""); set(v) = sp.edit().putString("diagFolderReport", v).apply()
+    var lastCleanupText: String get() = s("lastCleanupText", ""); set(v) = sp.edit().putString("lastCleanupText", v).apply()
+    var lastDailyRefreshDay: String get() = s("lastDailyRefreshDay", ""); set(v) = sp.edit().putString("lastDailyRefreshDay", v).apply()
     /** OFF, AUTO (each completed recording) or EXPORT (only when a diagnostic ZIP is made). */
     var transcriptionMode: String get() = s("transcriptionMode", "AUTO"); set(v) = sp.edit().putString("transcriptionMode", v).apply()
     /** Display name of the image chosen for "Show Image" (the image itself is copied into app storage). */

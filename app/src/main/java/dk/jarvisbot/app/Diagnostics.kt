@@ -228,6 +228,7 @@ object Diagnostics {
             .put("vad", "Silero VAD v4 (ONNX, as bundled with openWakeWord 0.5.1), offline")
             .put("onnxRuntime", "onnxruntime-android ${BuildConfig.ORT_VERSION}")
             .put("speechRecognition", "android.speech.SpeechRecognizer (system service; engine depends on device)")
+            .put("transcription", Transcription.ENGINE)
             .put("models", modelsInfo(ctx)))
         o.put("recognizer", recognizerInfo(ctx))
         o.put("permissions", permissions(ctx))

@@ -189,30 +189,8 @@ class DiagStore(private val ctx: Context) : SQLiteOpenHelper(ctx, "jarvis_diag.d
         writableDatabase.delete("recordings", "id=?", arrayOf(id))
     }
 
-    fun audioBytes(): Long = count("SELECT COALESCE(SUM(bytes),0) FROM recordings")
-
-    /** Deletes oldest recordings (unlabelled first) until total audio <= limit. Returns (count, bytes) deleted. */
-    fun enforceStorageLimit(limitBytes: Long): Pair<Int, Long> {
-        var total = audioBytes()
-        var n = 0
-        var freed = 0L
-        if (total <= limitBytes) return 0 to 0L
-        for (pass in 0..1) {
-            val sql = "SELECT $recCols FROM recordings " + (if (pass == 0) "WHERE label IS NULL " else "") + "ORDER BY ts_start ASC LIMIT 200"
-            while (total > limitBytes) {
-                val batch = ArrayList<RecordingRow>()
-                readableDatabase.rawQuery(sql, null).use { c -> while (c.moveToNext()) batch.add(recFrom(c)) }
-                if (batch.isEmpty()) break
-                for (r in batch) {
-                    if (total <= limitBytes) break
-                    fileFor(r).delete()
-                    writableDatabase.delete("recordings", "id=?", arrayOf(r.id))
-                    total -= r.bytes; freed += r.bytes; n++
-                }
-            }
-        }
-        return n to freed
-    }
+    /** Bytes of recordings that still have their phone copy (files in filesDir/audio). */
+    fun audioBytes(): Long = audioDir.listFiles()?.sumOf { it.length() } ?: 0L
 
     fun countsByKind(): Map<String, Pair<Long, Long>> {
         val m = LinkedHashMap<String, Pair<Long, Long>>()
@@ -309,15 +287,71 @@ class DiagStore(private val ctx: Context) : SQLiteOpenHelper(ctx, "jarvis_diag.d
         }
     }
 
-    /** Completed recordings saved after [sinceTs] that have not been copied to the sync folder yet. */
-    fun unsyncedSince(sinceTs: Long, limit: Int): List<RecordingRow> {
+    /** Completed recordings that have not been delivered to the diagnostic folder yet (oldest first). */
+    fun undelivered(limit: Int): List<RecordingRow> {
         ensureSyncTable()
         val res = ArrayList<RecordingRow>()
         readableDatabase.rawQuery(
-            "SELECT $recCols FROM recordings WHERE ts_start >= ? AND COALESCE(category,'') <> 'RECORDING' " +
-                "AND id NOT IN (SELECT recording_id FROM synced) ORDER BY ts_start ASC LIMIT $limit", arrayOf(sinceTs.toString())
+            "SELECT $recCols FROM recordings WHERE COALESCE(category,'') NOT IN ('RECORDING','EMPTY') " +
+                "AND id NOT IN (SELECT recording_id FROM synced) ORDER BY ts_start ASC LIMIT $limit", null
         ).use { c -> while (c.moveToNext()) res.add(recFrom(c)) }
         return res
+    }
+
+    /** Delivered recordings: export base name -> recording id. */
+    fun deliveredBases(): Map<String, String> {
+        ensureSyncTable()
+        val m = HashMap<String, String>()
+        readableDatabase.rawQuery("SELECT name, recording_id FROM synced", null).use { c -> while (c.moveToNext()) m[c.getString(0)] = c.getString(1) }
+        return m
+    }
+
+    fun forgetDelivered(recordingId: String) {
+        ensureSyncTable()
+        writableDatabase.delete("synced", "recording_id=?", arrayOf(recordingId))
+    }
+
+    /** Removes a recording's database row only (its files are handled by the caller). */
+    fun deleteRecordingRow(id: String) {
+        writableDatabase.delete("recordings", "id=?", arrayOf(id))
+    }
+
+    fun allRecordings(): List<RecordingRow> {
+        val res = ArrayList<RecordingRow>()
+        readableDatabase.rawQuery("SELECT $recCols FROM recordings ORDER BY ts_start ASC", null).use { c -> while (c.moveToNext()) res.add(recFrom(c)) }
+        return res
+    }
+
+    fun recordingsBetween(fromTs: Long, toTs: Long): List<RecordingRow> {
+        val res = ArrayList<RecordingRow>()
+        readableDatabase.rawQuery("SELECT $recCols FROM recordings WHERE ts_start >= ? AND ts_start < ? ORDER BY ts_start",
+            arrayOf(fromTs.toString(), toTs.toString())).use { c -> while (c.moveToNext()) res.add(recFrom(c)) }
+        return res
+    }
+
+    /** Events of one period, oldest first, streamed to [each] (the event log can be large). */
+    fun forEachEventBetween(fromTs: Long, toTs: Long, each: (EventRow) -> Unit) {
+        readableDatabase.rawQuery("SELECT id, ts, type, msg, data, interaction_id, recording_id, proc FROM events WHERE ts >= ? AND ts < ? ORDER BY id",
+            arrayOf(fromTs.toString(), toTs.toString())).use { c ->
+            while (c.moveToNext()) each(EventRow(c.getLong(0), c.getLong(1), c.getString(2), c.getString(3), c.getString(4), c.getString(5), c.getString(6), c.getString(7)))
+        }
+    }
+
+    fun recognitionsBetween(fromTs: Long, toTs: Long): List<RecognitionRow> =
+        recognitions(Int.MAX_VALUE).filter { it.tsStart >= fromTs && it.tsStart < toTs }.sortedBy { it.tsStart }
+
+    fun maxEventId(): Long = count("SELECT COALESCE(MAX(id),0) FROM events")
+
+    /** Local calendar days (yyyy-MM-dd) that have events, recordings or transcriptions. */
+    fun daysWithData(): List<String> {
+        ensureTranscriptTable()
+        val days = sortedSetOf<String>()
+        for (sql in listOf(
+            "SELECT DISTINCT date(ts/1000, 'unixepoch', 'localtime') FROM events",
+            "SELECT DISTINCT date(ts_start/1000, 'unixepoch', 'localtime') FROM recordings",
+            "SELECT DISTINCT day FROM transcripts",
+        )) readableDatabase.rawQuery(sql, null).use { c -> while (c.moveToNext()) c.getString(0)?.let { days.add(it) } }
+        return days.toList()
     }
 
     fun eventsBetween(fromTs: Long, toTs: Long, interactionId: String?): List<EventRow> {
@@ -325,7 +359,7 @@ class DiagStore(private val ctx: Context) : SQLiteOpenHelper(ctx, "jarvis_diag.d
         val sql = "SELECT id, ts, type, msg, data, interaction_id, recording_id, proc FROM events WHERE ts BETWEEN ? AND ? AND " +
             "(interaction_id = ? OR type LIKE 'HEARTBEAT%' OR type LIKE 'SERVICE%' OR type LIKE 'FGS%' OR type LIKE 'DEVICE_%' " +
             "OR type LIKE 'MIC_CLIENT%' OR type LIKE 'RECORDING_CLIENTS%' OR type LIKE 'AUDIO_MODE%' OR type LIKE 'PROCESS%' " +
-            "OR type LIKE 'SUSPECTED%' OR type LIKE 'CRASH%' OR type LIKE 'IMAGE_%' OR type LIKE 'SYNC_%' OR type LIKE 'STORAGE%') ORDER BY id"
+            "OR type LIKE 'SUSPECTED%' OR type LIKE 'CRASH%' OR type LIKE 'IMAGE_%' OR type LIKE 'SYNC_%' OR type LIKE 'DIAG_FOLDER%' OR type LIKE 'STORAGE%') ORDER BY id"
         readableDatabase.rawQuery(sql, arrayOf(fromTs.toString(), toTs.toString(), interactionId ?: "")).use { c ->
             while (c.moveToNext()) res.add(EventRow(c.getLong(0), c.getLong(1), c.getString(2), c.getString(3), c.getString(4), c.getString(5), c.getString(6), c.getString(7)))
         }
@@ -341,7 +375,7 @@ class DiagStore(private val ctx: Context) : SQLiteOpenHelper(ctx, "jarvis_diag.d
         return res
     }
 
-    /** Deletes local recordings that started before [ts]. Returns (count, bytes). Sync folder copies are not touched. */
+    /** Deletes local recordings that started before [ts]. Returns (count, bytes). Diagnostic-folder copies are not touched. */
     fun deleteRecordingsBefore(ts: Long): Pair<Int, Long> {
         val rows = ArrayList<RecordingRow>()
         readableDatabase.rawQuery("SELECT $recCols FROM recordings WHERE ts_start < ? AND COALESCE(category,'') <> 'RECORDING'", arrayOf(ts.toString()))

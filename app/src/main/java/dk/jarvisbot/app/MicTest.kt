@@ -91,7 +91,7 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
                 val fixed = r.copy(category = "INTERRUPTED", bytes = f.length(),
                     durationMs = dataBytes / 2 * 1000 / r.sampleRate, meta = meta.toString())
                 store.insertRecording(fixed)
-                SyncFolder.publish(fixed)
+                DiagnosticFolder.publish(fixed)
                 Transcription.onRecordingSaved(fixed)
                 store.log("MICTEST_FILE_RECOVERED", "${r.file}: session was killed while recording; file kept (${dataBytes / 2 * 1000 / r.sampleRate} ms)",
                     JSONObject().put("bytes", f.length()), interactionId = r.interactionId, recordingId = r.id)
@@ -163,7 +163,7 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
                 .put("app", "${BuildConfig.VERSION_NAME} (${BuildConfig.GIT_SHA})"),
             interactionId = sessionId, sync = true
         )
-        SyncFolder.catchUp()
+        DiagnosticFolder.catchUp()
         thread = Thread({ runCapture() }, "jarvis-mictest").also { it.start() }
         watchdog = Thread({ runWatchdog() }, "jarvis-mictest-watchdog").also { it.start() }
     }
@@ -473,7 +473,7 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             if (now - lastSessionLog >= SESSION_LOG_INTERVAL_MS) {
                 lastSessionLog = now
                 val startTs = MicStatus.startTs
-                store.runOnWriter { SyncFolder.publishSessionLog(sessionId, startTs, null) }
+                store.runOnWriter { DiagnosticFolder.publishSessionLog(sessionId, startTs, null) }
             }
         }
     }
@@ -551,7 +551,10 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
                 .put("reads", totalReads).put("emptyReads", emptyReads).put("readErrors", readErrors)
         store.log("MICTEST_SESSION_STOP", verdict, summary, interactionId = sessionId, sync = true)
         val startTs = MicStatus.startTs
-        store.runOnWriter { SyncFolder.publishSessionLog(sessionId, startTs, summary) }
+        store.runOnWriter {
+            DiagnosticFolder.publishSessionLog(sessionId, startTs, summary)
+            DiagnosticFolder.listeningStopped(DailyReports.dayOf(startTs)) // refresh the daily diagnostics
+        }
         setState(if (micOpens == 0 || totalSamples == 0L) "FAILED" else "STOPPED", verdict)
     }
 
@@ -620,8 +623,7 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
                 interactionId = sessionId, recordingId = id
             )
             store.runOnWriter {
-                val (cnt, freed) = store.enforceStorageLimit(app.prefs.storageLimitMb.toLong() * 1024 * 1024)
-                if (cnt > 0) store.log("STORAGE_PRUNED", "Deleted $cnt oldest recordings ($freed bytes) to stay under ${app.prefs.storageLimitMb} MB")
+                StorageManager.requestCheck()
             }
         }
 
@@ -649,7 +651,7 @@ class MicTest(private val app: JarvisApp, private val onStateChange: () -> Unit)
             store.runOnWriter {
                 store.insertRecording(row)
                 if (closeReason != null) {
-                    SyncFolder.publish(row) // completed: copy to the sync folder (if configured)
+                    DiagnosticFolder.publish(row) // completed: copy to the diagnostic folder (if chosen)
                     Transcription.onRecordingSaved(row)
                 }
             }

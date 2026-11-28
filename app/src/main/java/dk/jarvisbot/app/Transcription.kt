@@ -31,7 +31,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - Mode OFF / AUTO (each completed recording, newest first) / EXPORT (only when a diagnostic ZIP is made).
  * - Results live in the `transcripts` table (one row per recording and audio variant, so reprocessing never
  *   duplicates); the daily files are rendered from it, in recording order, by the recording's own date.
- * - Daily files are written locally (filesDir/transcripts) and copied to the sync folder under a temporary name,
+ * - Daily files are written locally (filesDir/transcripts) and copied to <day>/ in the diagnostic folder under a temporary name,
  *   then renamed, so a sync app never sees a half-written file.
  */
 object Transcription {
@@ -90,7 +90,7 @@ object Transcription {
         kick()
     }
 
-    /** New sync folder: copy all daily files there. */
+    /** New diagnostic folder: copy all daily files there. */
     fun publishAllDays() {
         start()
         jobs.offer(Runnable { dirtyDays.addAll(app.store.transcriptDays()); flush(force = true) })
@@ -113,7 +113,7 @@ object Transcription {
         todo.forEachIndexed { i, r ->
             progress("Transcribing ${i + 1} / ${todo.size} (offline speech recognition)…")
             try {
-                onWorker { transcribe(r, VARIANT_RAW, null, SyncFolder.baseName(r) + "_raw.wav", null) }
+                onWorker { transcribe(r, VARIANT_RAW, null, DiagnosticFolder.baseName(r) + "_raw.wav", null) }
             } catch (e: EngineUnavailable) {
                 return "transcription unavailable: ${e.message}"
             }
@@ -167,7 +167,7 @@ object Transcription {
                     val r = app.store.nextUntranscribed()
                     if (r != null) {
                         try {
-                            transcribe(r, VARIANT_RAW, null, SyncFolder.baseName(r) + "_raw.wav", null)
+                            transcribe(r, VARIANT_RAW, null, DiagnosticFolder.baseName(r) + "_raw.wav", null)
                         } catch (_: EngineUnavailable) {
                         }
                         busy = true
@@ -261,10 +261,7 @@ object Transcription {
         val t0 = System.currentTimeMillis()
         try {
             val row = try {
-                val (pcm, sr) = audio ?: store.fileFor(r).let { f ->
-                    if (!f.exists()) throw FileNotFoundException("audio file no longer on the phone: ${r.file}")
-                    Wav.read(f)
-                }
+                val (pcm, sr) = audio ?: DiagnosticFolder.readRecording(r) // phone copy, or else the diagnostic-folder copy
                 val t = engine().transcriber.transcribe(pcm, sr, LANGUAGES)
                 val info = infoJson(t, sr)
                 extra?.keys()?.forEach { k -> info.put(k, extra.get(k)) }
@@ -282,6 +279,7 @@ object Transcription {
                 )
             }
             store.upsertTranscript(row)
+            DiagnosticFolder.updateDiagnostics(r) // per-recording diagnostics now include the transcription
             store.log(
                 "TRANSCRIBED", "${variant.lowercase()} $audioName: ${row.status}${row.language?.let { " ($it)" } ?: ""}",
                 JSONObject().put("variant", variant).put("status", row.status).put("language", row.language)
@@ -360,7 +358,7 @@ object Transcription {
             val tmp = File(dir, ".${f.name}.tmp")
             tmp.writeText(render(day), Charsets.UTF_8)
             if (!tmp.renameTo(f)) { f.delete(); tmp.renameTo(f) }
-            SyncFolder.publishTranscript(f)
+            DiagnosticFolder.publishTranscript(day, f)
         }
         dirtyDays.clear()
         lastSync = now
