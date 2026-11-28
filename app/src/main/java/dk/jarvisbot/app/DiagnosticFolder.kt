@@ -54,6 +54,8 @@ object DiagnosticFolder {
     /** Shown in the UI while longer folder work (reorganising, catching up) runs. */
     @Volatile var busyWith: String? = null
     @Volatile private var needsCatchUp = true
+    /** The catch-up right after a reorganisation is reported on the main screen (later ones only in the event log). */
+    @Volatile private var reportNextCatchUp = false
     private var lastFailLog = 0L
     private var lastRefreshedEventId = -1L
     private val started = AtomicBoolean(false)
@@ -427,8 +429,9 @@ object DiagnosticFolder {
         busyWith = null
         if (copied > 0) {
             app.store.log("DIAG_FOLDER_CATCH_UP", "Copied $copied recording(s) that were not in the diagnostic folder yet")
-            appendReport("copied $copied recording(s) from the phone that were not in the folder yet")
+            if (reportNextCatchUp) appendReport("copied $copied recording(s) from the phone that were not in the folder yet")
         }
+        reportNextCatchUp = false
     }
 
     private fun publishNow(r: DiagStore.RecordingRow): Boolean {
@@ -564,6 +567,7 @@ object DiagnosticFolder {
                 .put("staleTemporaryFiles", staleTemp).put("ms", System.currentTimeMillis() - t0))
         app.prefs.diagFolderReport = ""
         if (parts.isNotEmpty()) appendReport(parts.joinToString("; "))
+        reportNextCatchUp = true
         // diagnostics of recordings transcribed before the reorganisation now get their transcription
         for ((base, id) in app.store.deliveredBases()) {
             if (base.length < 23 || app.store.transcript(id, "RAW") == null) continue
