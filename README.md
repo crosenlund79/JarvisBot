@@ -71,7 +71,7 @@ Exported ZIPs in the folder are shown but not counted or deleted. Android always
 2. Then the oldest recordings and session logs are deleted from the phone and the folder; labelled recordings go last.
 3. Daily transcription and diagnostics files are kept.
 
-Each cleanup is shown on the main screen and logged (`STORAGE_CLEANUP`). Recordings whose phone copy was removed still play, export and transcribe from the folder copy.
+When updating from build 11 or older, the limit starts at the smallest choice (at least 2 GB) that keeps everything already stored, so the update deletes nothing; lower it on the main screen if you like. Each cleanup is shown on the main screen and logged (`STORAGE_CLEANUP`). Recordings whose phone copy was removed still play, export and transcribe from the folder copy.
 
 ### Voice-enhanced export
 Choose *Voice-enhanced* or *Both* before exporting. Each enhanced copy is computed only during that export, by the built-in method `jarvis-speech-v1`, in pure Kotlin and fully offline:

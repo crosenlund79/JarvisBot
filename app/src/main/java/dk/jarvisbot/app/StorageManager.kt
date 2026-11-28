@@ -90,7 +90,18 @@ object StorageManager {
     /** Applies the limit and the free-space reserve (folder thread). */
     fun enforceNow(forceScan: Boolean) {
         val store = app.store
-        val u = usageNow(forceScan)
+        var u = usageNow(forceScan)
+        if (DiagnosticFolder.isConfigured() && !u.folderKnown) return // folder not readable right now: decide later, with full information
+        if (!app.prefs.sp.contains("storageLimitTotalMb")) {
+            // First start with the single limit: never delete data that was already kept under the old limits.
+            val neededMb = (u.total * 1.25 / 1e6).toLong()
+            val mb = LIMITS_MB.firstOrNull { it >= 2000 && it >= neededMb } ?: LIMITS_MB.last()
+            app.prefs.storageLimitTotalMb = mb
+            store.log("STORAGE_LIMIT_SET", "Storage limit set to ${label(mb)}" +
+                if (mb > 2000) " so the ${mb(u.total)} already stored are kept (change it on the main screen)" else " (default)",
+                JSONObject().put("limitMb", mb).put("usageBytes", u.total))
+            u = usageNow(false)
+        }
         val overLimit = u.total - u.limit
         val belowReserve = u.reserve - u.free
         if (overLimit <= 0 && belowReserve <= 0) return
